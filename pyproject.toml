@@ -1,0 +1,42 @@
+[project]
+name = "disaster-spatial-agent"
+version = "0.1.0"
+description = "DORA-style MCP disaster agent with Skills, spatial state, verification and adaptive HITL"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=3.1.0",
+  "pydantic-ai-slim[mcp]>=1.36.0",
+  "pydantic>=2.10",
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+  "python-dotenv>=1.0",
+  "pyyaml>=6.0",
+  "respx>=0.23.1",
+  "earthengine-api>=1.7.40",
+  "geemap>=0.37.2",
+  "folium>=0.20.0",
+  "fastapi>=0.141.1",
+  "uvicorn>=0.52.3",
+  "geopandas>=1.1.4",
+  "shapely>=2.1.2",
+  "networkx>=3.6.1",
+  "rasterio>=1.4.4",
+  "mcp>=1.29.0",
+  "numpy>=2.4.6",
+  "pyproj>=3.7.2",
+  "osmnx>=2.1.1",
+  "requests>=2.34.2",
+  "matplotlib>=3.11.1",
+  "anthropic>=1.1.0",
+  "scikit-learn>=1.9.0",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app"]

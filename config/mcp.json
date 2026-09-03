@@ -1,0 +1,61 @@
+{
+  "mcpServers": {
+    "usgs_metadata": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/usgs_metadata.py"]
+    },
+    "flood": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/flood_alert.py"]
+    },
+    "geocode": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/geocode.py"]
+    },
+    "noaa": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/noaa_weather.py"]
+    },
+    "nws": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/nws_alerts.py"]
+    },
+    "osm": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/osm_infrastructure.py"]
+    },
+    "population": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/population_exposure.py"]
+    },
+    "resource": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/resource_manager.py"]
+    },
+    "social_vulnerability": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/social_vulnerability.py"]
+    },
+    "gee-flood-extent": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/gee_flood_extent.py"],
+      "env": {
+        "GEE_SERVICE_ACCOUNT_KEY_PATH": "${GEE_SERVICE_ACCOUNT_KEY_PATH}",
+        "GEE_SERVICE_ACCOUNT_EMAIL": "${GEE_SERVICE_ACCOUNT_EMAIL}",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "gis-raster": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/gis_raster_server.py"]
+    },
+    "gis-vector": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/gis_vector_server.py"]
+    },
+    "gis-viz": {
+      "command": "python",
+      "args": ["${PROJECT_ROOT}/mcp_servers/gis_viz_server.py"]
+    }
+  }
+}

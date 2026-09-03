@@ -1,0 +1,1386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Disaster Spatial Decision Support Agent</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        /* Reset & Base */
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fa;
+            color: #1a2a3a;
+        }
+        /* Map */
+        #map {
+            height: 100vh;
+            width: 100%;
+            transition: filter 0.3s;
+        }
+        #map.loading {
+            filter: grayscale(80%) blur(2px);
+            pointer-events: none;
+        }
+        /* Loading Overlay */
+        #loading-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.4);
+            z-index: 9999;
+            display: none;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            color: white;
+            font-size: 24px;
+            font-weight: 600;
+            backdrop-filter: blur(2px);
+        }
+        #loading-overlay.active { display: flex; }
+        #loading-overlay .spinner {
+            border: 6px solid rgba(255,255,255,0.3);
+            border-top: 6px solid #ffffff;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* Website Title - smaller */
+        #site-title {
+            position: absolute;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.85);
+            padding: 4px 20px;
+            border-radius: 30px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+            font-size: 20px;
+            font-weight: 600;
+            color: #1a3c5e;
+            backdrop-filter: blur(4px);
+            white-space: nowrap;
+        }
+
+        /* Info Panel - align with title top */
+        #info-panel {
+            position: absolute;
+            top: 10px;
+            max-height: calc(100vh - 120px);
+            right: 20px;
+            width: 360px;
+            overflow-y: auto;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 12px;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.25);
+            padding: 16px 20px;
+            z-index: 1000;
+            font-size: 14px;
+            border-left: 5px solid #4a90e2;
+        }
+        /* No close button, so panel always visible */
+        #info-panel h3 {
+            margin: 0 0 12px 0;
+            color: #1a3c5e;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        /* Collapsible sections */
+        .collapsible {
+            cursor: pointer;
+            user-select: none;
+            font-weight: 600;
+            color: #2c3e50;
+            border-bottom: 2px solid #e0e7ef;
+            padding: 6px 0 4px 0;
+            margin: 12px 0 6px 0;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .collapsible .toggle-icon {
+            font-size: 16px;
+            font-weight: 400;
+            color: #888;
+        }
+        .collapsible-content {
+            overflow: hidden;
+            transition: max-height 0.25s ease-out;
+            max-height: 5000px; /* fallback */
+        }
+        .collapsible-content.collapsed {
+            max-height: 0;
+        }
+        .sub-group {
+            background: #f8f9fb;
+            border-radius: 6px;
+            padding: 4px 10px;
+            margin: 4px 0 8px 0;
+        }
+        .sub-group .group-label {
+            font-weight: 400;
+            color: #2c3e50;
+            font-size: 13px;
+            margin-bottom: 2px;
+        }
+        .sub-group .stat-row {
+            border-bottom: 1px solid #e8eaed;
+            padding: 2px 0;
+            font-size: 12px;
+        }
+        .sub-group .stat-row:last-child { border-bottom: none; }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #f0f2f5;
+        }
+        .stat-label { color: #555; font-weight: 500; }
+        .stat-value { font-weight: 600; color: #1a3c5e; word-break: break-word; }
+        .forecast-entry { padding: 4px 0; border-bottom: 1px solid #e8eaed; }
+        .forecast-entry:last-child { border-bottom: none; }
+        .forecast-entry .period { font-weight: 600; color: #1a3c5e; text-align: right; }
+        .forecast-entry .data { color: #1a3c5e; font-weight: 600; text-align: right; margin-top: 1px; }
+        .forecast-entry .status { color: #777; text-align: right; margin-top: 1px; font-size: 12px; }
+        .forecast-day { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .4px; margin: 6px 0 2px; text-align: right; border-bottom: 1px dashed #dde3ea; padding-bottom: 2px; }
+
+        /* ===== Right panel, top to bottom: raw data / lambda+Pareto / status+decision ===== */
+        .panel-section {
+            margin-top: 10px;
+            border-top: 1px solid #dfe6ee;
+            padding-top: 4px;
+        }
+        .panel-section:first-of-type { border-top: none; margin-top: 0; }
+        .section-header {
+            cursor: pointer; user-select: none;
+            display: flex; justify-content: space-between; align-items: center;
+            font-weight: 700; color: #1a3c5e; font-size: 13px;
+            letter-spacing: .3px; padding: 6px 0;
+            border-bottom: 2px solid #1a3c5e;
+        }
+        .section-header .toggle-icon { font-size: 16px; font-weight: 400; color: #888; }
+        .section-body.collapsed { display: none; }
+        .fusion-var { padding: 5px 0; border-bottom: 1px solid #eef1f5; font-size: 12px; }
+        .fusion-var .name { font-weight: 600; color: #1a3c5e; }
+        .conflict-flag { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:9px; background:#ffcdd2; color:#c62828; font-size:10px; font-weight:700; }
+        .pareto-point { cursor: pointer; }
+        .pareto-point:hover { stroke: #000; stroke-width: 2; }
+        .plan-detail { margin-top: 8px; padding: 8px; background: #f6f9fc; border-radius: 6px; border: 1px solid #dde5ee; font-size: 12px; }
+        .plan-detail .tract-list { font-family: ui-monospace, monospace; font-size: 11px; color: #444; margin-top: 4px; }
+        .lambda-box { padding: 8px; background: #f0f7ff; border-radius: 6px; margin-top: 8px; font-size: 12px; }
+        .lambda-box input[type=range] { width: 100%; }
+        #report-text { white-space: pre-wrap; font-family: inherit; font-size: 12px; color: #233; line-height: 1.5; max-height: 240px; overflow-y: auto; }
+        .uncertainty-box { padding: 6px 8px; background: #fff8e1; border-radius: 6px; margin: 6px 0; font-size: 12px; }
+
+        /* Error modal */
+        #error-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:11000; justify-content:center; align-items:center; }
+        #error-modal .card { background:#fff; border-radius:12px; padding:22px 26px; max-width:560px; width:90%; box-shadow:0 8px 30px rgba(0,0,0,.3); }
+        #error-modal h3 { margin:0 0 8px; color:#c62828; }
+        #error-modal p { margin:0 0 14px; color:#333; font-size:14px; word-break:break-word; white-space:pre-wrap; }
+        #error-modal button { padding:8px 18px; background:#c62828; color:#fff; border:none; border-radius:6px; cursor:pointer; font-weight:600; }
+
+        /* HITL sliders */
+        .hitl-slider-row { margin: 10px 0; }
+        .hitl-slider-row label { display:flex; justify-content:space-between; font-size:13px; color:#333; margin-bottom:4px; }
+        .hitl-slider-row label .val { font-weight:700; color:#1a3c5e; }
+        .hitl-slider-row input[type=range] { width:100%; }
+        .badge {
+            display: inline-block;
+            padding: 2px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .badge-normal { background: #c8e6c9; color: #2e7d32; }
+        .badge-warning { background: #fff9c4; color: #f57f17; }
+        .badge-danger { background: #ffcdd2; color: #c62828; }
+        .badge-unknown { background: #e0e0e0; color: #555; }
+        #recommendation {
+            margin-top: 14px;
+            padding: 10px 12px;
+            background: #f0f7ff;
+            border-radius: 6px;
+            font-size: 13px;
+            border-left: 3px solid #4a90e2;
+        }
+        #recommendation strong { display: block; margin-bottom: 4px; }
+        #data-sources {
+            margin-top: 12px;
+            padding-top: 8px;
+            border-top: 1px solid #e0e7ef;
+            font-size: 12px;
+            color: #555;
+            text-align: center;
+        }
+
+        /* GIS Map floating button & modal */
+        #gis-map-btn {
+            position: absolute;
+            bottom: 96px;
+            left: 20px;
+            z-index: 1000;
+            padding: 10px 18px;
+            background: rgba(255,255,255,0.92);
+            border: none;
+            border-radius: 30px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+            font-size: 14px;
+            font-weight: 600;
+            color: #1a3c5e;
+            cursor: pointer;
+            backdrop-filter: blur(4px);
+        }
+        #gis-map-btn:hover { background: #ffffff; }
+        #gis-map-modal {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.55);
+            z-index: 9000;
+            display: none;
+            justify-content: center;
+            align-items: center;
+            padding: 30px;
+        }
+        #gis-map-modal.open { display: flex; }
+        .gis-map-card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 8px 40px rgba(0,0,0,0.4);
+            width: min(1100px, 92vw);
+            max-height: 90vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .gis-map-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            background: #f0f4f8;
+            font-weight: 600;
+            color: #1a3c5e;
+            border-bottom: 1px solid #e0e7ef;
+        }
+        #gis-map-close {
+            border: none;
+            background: #e0e0e0;
+            color: #333;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 14px;
+            line-height: 1;
+        }
+        #gis-map-close:hover { background: #c62828; color: white; }
+        #gis-map-iframe {
+            border: none;
+            display: block;
+            width: 100%;
+            height: 68vh;
+        }
+
+        /* Query Form */
+        #query-form {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            background: rgba(255,255,255,0.92);
+            padding: 10px 18px;
+            border-radius: 40px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.2);
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            width: 60%;
+            max-width: 700px;
+            backdrop-filter: blur(4px);
+        }
+        #query-form input[type="text"] {
+            flex: 1;
+            padding: 8px 16px;
+            border: 1px solid #ccc;
+            border-radius: 30px;
+            font-size: 16px;
+            min-width: 100px;
+        }
+        #query-form button {
+            padding: 8px 28px;
+            background: #4a90e2;
+            color: white;
+            border: none;
+            border-radius: 30px;
+            font-size: 16px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+        #query-form button:hover:not(:disabled) { background: #2a6fb0; }
+        #query-form button:disabled {
+            background: #a0b8d0;
+            cursor: not-allowed;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            #info-panel { width: 280px; right: 10px; top: 10px; font-size: 13px; padding: 12px 14px; }
+            #query-form { width: 92%; bottom: 12px; flex-wrap: wrap; justify-content: center; }
+            #query-form input[type="text"] { width: 100%; }
+            #site-title { font-size: 16px; padding: 2px 14px; top: 8px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Website Title (smaller) -->
+    <div id="site-title">Disaster Spatial Decision Support</div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+        <span>Assessing...</span>
+    </div>
+
+    <!-- Map -->
+    <div id="map"></div>
+
+    <!-- Layer control: right of the zoom buttons, top-left (top-right is the data panel) -->
+    <style>
+        .leaflet-top.leaflet-left .leaflet-control-layers {
+            margin-left: 52px;          /* right of the zoom buttons */
+            max-width: 320px;
+            font-size: 12px;
+            box-shadow: 0 1px 5px rgba(0,0,0,.3);
+        }
+        .leaflet-top.leaflet-left .leaflet-control-layers-list {
+            max-height: 55vh;
+            overflow-y: auto;
+        }
+    </style>
+
+    <!-- Info Panel (no close button): three sections = raw data / lambda+Pareto / status+decision -->
+    <div id="info-panel">
+        <h3>Key Metrics</h3>
+
+        <!-- ══════ Section 1: raw data (Observations + Derived Metrics + fused evidence) ══════ -->
+        <div class="panel-section">
+        <div class="section-header" onclick="toggleSection(this)">
+            <span>Risk Baseline</span>
+            <span class="toggle-icon">−</span>
+        </div>
+        <div class="section-body">
+
+        <!-- ====== OBSERVATIONS (collapsible) ====== -->
+        <div class="collapsible" onclick="toggleSection(this)">
+            <span>Observations</span>
+            <span class="toggle-icon">−</span>
+        </div>
+        <div class="collapsible-content" id="obs-content">
+            <div class="stat-row">
+                <span class="stat-label">Gauge station</span>
+                <span class="stat-value" id="station-id">--</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Precipitation</span>
+                <span class="stat-value" id="precipitation">--</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Forecast</span>
+                <span class="stat-value" id="forecast">--</span>
+            </div>
+            <div class="sub-group" id="forecast-periods-group" style="display:none;">
+                <div class="collapsible" style="padding:3px 0; cursor:pointer;" onclick="toggleSection(this)">
+                    <span class="group-label" id="forecast-periods-label" style="cursor:pointer;">7-Day Forecast</span>
+                    <span class="toggle-icon">+</span>
+                </div>
+                <div class="collapsible-content collapsed" id="forecast-periods"></div>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Water Level</span>
+                <span class="stat-value" id="water-level">--</span>
+            </div>
+
+            <div class="sub-group">
+                <div class="group-label">Flood Thresholds</div>
+                <div class="stat-row">
+                    <span class="stat-label">Action</span>
+                    <span class="stat-value" id="action-stage">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Minor</span>
+                    <span class="stat-value" id="minor-stage">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Moderate</span>
+                    <span class="stat-value" id="moderate-stage">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Major</span>
+                    <span class="stat-value" id="major-stage">--</span>
+                </div>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-label">Flood Extent</span>
+                <span class="stat-value" id="flood-extent">--</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Active Alerts</span>
+                <span class="stat-value" id="alerts">--</span>
+            </div>
+        </div>
+
+        <!-- ====== DERIVED METRICS (collapsible) ====== -->
+        <div class="collapsible" onclick="toggleSection(this)">
+            <span>Derived Metrics</span>
+            <span class="toggle-icon">−</span>
+        </div>
+        <div class="collapsible-content" id="derived-content">
+            <div class="stat-row">
+                <span class="stat-label" title="Total population of the census tracts returned by the CDC/ATSDR SVI service within its configured radius">Population (SVI tracts)</span>
+                <span class="stat-value" id="population-total">--</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Affected population</span>
+                <span class="stat-value" id="population-affected">--</span>
+            </div>
+
+            <div class="sub-group">
+                <div class="group-label">Infrastructure (OSM)</div>
+                <div class="stat-row">
+                    <span class="stat-label">Affected buildings</span>
+                    <span class="stat-value" id="buildings">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Affected facilities</span>
+                    <span class="stat-value" id="facilities">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Affected roads</span>
+                    <span class="stat-value" id="roads">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Affected bridges</span>
+                    <span class="stat-value" id="bridges">--</span>
+                </div>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-label">SVI (pop‑weighted)</span>
+                <span class="stat-value" id="svi-value">--</span>
+            </div>
+            <div class="sub-group">
+                <div class="group-label">Decision indices (0–1)</div>
+                <div class="stat-row"><span class="stat-label">CDRI</span><span class="stat-value" id="cdri">--</span></div>
+                <div class="stat-row"><span class="stat-label">EPS</span><span class="stat-value" id="eps">--</span></div>
+                <div class="stat-row"><span class="stat-label">Data confidence</span><span class="stat-value" id="data-confidence">--</span></div>
+            </div>
+        </div>
+
+        <!-- ====== FUSED EVIDENCE (details + conflict flags) ====== -->
+        <div class="collapsible" onclick="toggleSection(this)">
+            <span>Fused Evidence</span>
+            <span class="toggle-icon">−</span>
+        </div>
+        <div class="collapsible-content" id="fused-content">
+            <div id="fused-list" style="color:#777;">Run an assessment to populate.</div>
+        </div>
+
+        </div><!-- /section-body section 1 -->
+        </div><!-- /panel-section section 1 -->
+
+        <!-- ══════ Section 2: lambda slider + Pareto optimization ══════ -->
+        <div class="panel-section">
+        <div class="section-header" onclick="toggleSection(this)">
+            <span>Equity-Efficiency</span>
+            <span class="toggle-icon">−</span>
+        </div>
+        <div class="section-body">
+            <div class="lambda-box" id="lambda-box" style="display:none;">
+                <strong>λ vulnerability weight</strong> <span id="lambda-val">1.0</span>
+                <input type="range" id="lambda-slider" min="0" max="3" step="0.1" value="1.0">
+                <div id="lambda-result" style="margin-top:6px; font-size:12px;"></div>
+            </div>
+            <div id="pareto-scatter" style="margin-top:8px;"><div style="color:#777;">Run an assessment to populate.</div></div>
+            <div id="pareto-suppressed" style="display:none;background:#F1F8E9;border:1px solid #A5D6A7;padding:8px 10px;border-radius:6px;font-size:12px;">
+                <b>No active hazard</b> (gauge at/below action stage, CDRI = 0) — the efficiency–equity panel is pre-positioning analysis only; no dispatch recommendation is made.
+            </div>
+            <div id="plan-detail" class="plan-detail" style="display:none;"></div>
+        </div>
+        </div><!-- /panel-section section 2 -->
+
+        <!-- ══════ Section 3: status + next action + final decision ══════ -->
+        <div class="panel-section">
+        <div class="section-header" onclick="toggleSection(this)">
+            <span>Action Plan</span>
+            <span class="toggle-icon">−</span>
+        </div>
+        <div class="section-body">
+            <!-- Status & Recommendation -->
+            <div class="stat-row" style="border-bottom: none; margin-top: 4px;">
+                <span class="stat-label">Status</span>
+                <span class="stat-value" id="status-badge"><span class="badge badge-unknown">--</span></span>
+            </div>
+
+            <div id="recommendation">
+                <strong>Next Action</strong>
+                <span id="next-action-text">Waiting for assessment...</span>
+            </div>
+
+            <div id="decision-extras"></div>
+
+            <div class="collapsible" onclick="toggleSection(this)" style="margin-top:8px;">
+                <span>Full Decision Report</span>
+                <span class="toggle-icon">+</span>
+            </div>
+            <div class="collapsible-content collapsed" id="report-text">Run an assessment to populate.</div>
+        </div>
+        </div><!-- /panel-section section 3 -->
+
+        <div id="data-sources">Data Sources: USGS, NWPS, CDC SVI, OSM, NWS</div>
+    </div>
+
+    <!-- GIS map (flood extent + routing render): floating modal + reopen button -->
+    <button id="gis-map-btn" title="Show flood extent & routing map">🗺️ GIS Map</button>
+    <div id="gis-map-modal">
+        <div class="gis-map-card">
+            <div class="gis-map-header">
+                <span>📍 Situational Awareness Map — Flood Extent &amp; Routing</span>
+                <button id="gis-map-close" title="Close">✕</button>
+            </div>
+            <iframe id="gis-map-iframe" title="GIS flood map"></iframe>
+        </div>
+    </div>
+
+    <!-- Query Form -->
+    <div id="query-form">
+        <input type="text" id="query-input" placeholder="e.g., flood Manhattan Kansas 06887000 — or — assess flooding near Friendswood station 08077600" value="Assess flood around Friendswood station 08077600">
+        <input type="text" id="event-date" placeholder="event date YYYY-MM-DD (optional)" title="Optional event date — empty = real-time assessment; a past date = historical replay with strict time alignment" style="width:170px;padding:8px;border-radius:6px;border:1px solid #cfd8e3;background:#fff;color:#1a2b3c;">
+        <button id="submit-demo" title="Offline demo: full pipeline against fixtures — no network, guaranteed equity ledger and lambda slider on any date" style="background:#2e7d32;">Demo</button>
+        <button id="submit-query">Execute</button>
+    </div>
+
+    <!-- Error modal (assessment failure reason) -->
+    <div id="error-modal">
+        <div class="card">
+            <h3>⚠️ Assessment Failed</h3>
+            <p id="error-detail"></p>
+            <button onclick="document.getElementById('error-modal').style.display='none'">Dismiss</button>
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // ------------------------------------------------------------
+        //  Map Initialization (Pennsylvania)
+        // ------------------------------------------------------------
+        const map = L.map('map').setView([39.952, -75.192], 14);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        const markerLayer = L.layerGroup().addTo(map);
+
+        // Custom icons (red target, blue station)
+        function createColoredIcon(color) {
+            return L.divIcon({
+                html: `<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 2C9.4 2 4 7.4 4 14c0 8 12 18 12 18s12-10 12-18c0-6.6-5.4-12-12-12z" fill="${color}" stroke="white" stroke-width="1.5"/><circle cx="16" cy="14" r="4" fill="white"/></svg>`,
+                iconSize: [32, 32],
+                iconAnchor: [16, 32],
+                popupAnchor: [0, -32],
+                className: 'custom-marker'
+            });
+        }
+        const redMarker = createColoredIcon('#e74c3c');
+        const blueMarker = createColoredIcon('#3498db');
+
+        // ------------------------------------------------------------
+        //  DOM refs
+        // ------------------------------------------------------------
+        const $ = id => document.getElementById(id);
+        const loadingOverlay = $('loading-overlay');
+        const submitBtn = $('submit-query');
+        const queryInput = $('query-input');
+        const infoPanel = $('info-panel');
+
+        // ------------------------------------------------------------
+        //  Collapsible Toggle
+        // ------------------------------------------------------------
+        function toggleSection(el) {
+            const content = el.nextElementSibling;
+            const icon = el.querySelector('.toggle-icon');
+            if (content.classList.contains('collapsed')) {
+                content.classList.remove('collapsed');
+                icon.textContent = '−';
+            } else {
+                content.classList.add('collapsed');
+                icon.textContent = '+';
+            }
+        }
+        // Initially all sections expanded (default no 'collapsed' class)
+
+        // ------------------------------------------------------------
+        //  Update UI
+        // ------------------------------------------------------------
+        function updateUI(data) {
+            if (!data || !data.structured) return;
+            const s = data.structured;
+
+            // Observations
+            $('station-id').textContent = s.station_name ? `${s.station_name} (${s.station_id || 'USGS'})` : (s.station_id || '--');
+            $('precipitation').textContent = s.precipitation || '--';
+            $('forecast').textContent = s.forecast || '--';
+
+            // Forecast periods: grouped by date, day/night periods per
+            // day, each with a data line and a status line, right-aligned.
+            const fp = s.forecast_periods || [];
+            const fpGroup = $('forecast-periods-group');
+            if (fp.length) {
+                $('forecast-periods-label').textContent = `Forecast Periods (${fp.length})`;
+
+                // Day/night distinction from the NWS period name
+                const isNight = p =>
+                    /night|tonight|evening|overnight/i.test(p.period || '');
+
+                // Group by the date part of the timestamp (order fallback without one)
+                const byDate = new Map();
+                fp.forEach(p => {
+                    let dayKey = 'Forecast';
+                    if (p.timestamp) {
+                        const d = new Date(p.timestamp);
+                        if (!isNaN(d)) {
+                            dayKey = d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+                        }
+                    }
+                    if (!byDate.has(dayKey)) byDate.set(dayKey, []);
+                    byDate.get(dayKey).push(p);
+                });
+
+                let html = '';
+                for (const [dayKey, periods] of byDate) {
+                    html += `<div class="forecast-day">${dayKey}</div>`;
+                    // Day periods first, night after
+                    const ordered = [
+                        ...periods.filter(p => !isNight(p)),
+                        ...periods.filter(isNight),
+                    ];
+                    for (const p of ordered) {
+                        const temp = (p.temperature !== undefined && p.temperature !== null)
+                            ? `${p.temperature}°${p.temperature_unit || 'F'}` : '';
+                        const pop = (p.probability_of_precipitation !== undefined && p.probability_of_precipitation !== null)
+                            ? `PoP ${p.probability_of_precipitation}%` : '';
+                        const wind = p.wind_speed ? `${p.wind_speed}` : '';
+                        const dataLine = [temp, pop, wind].filter(Boolean).join(' • ') || '--';
+                        const statusLine = p.short_forecast || '';
+                        html += `<div class="forecast-entry">
+                            <div class="period">${p.period || '--'}</div>
+                            <div class="data">${dataLine}</div>
+                            <div class="status">${statusLine}</div>
+                        </div>`;
+                    }
+                }
+                $('forecast-periods').innerHTML = html;
+                fpGroup.style.display = 'block';
+            } else {
+                fpGroup.style.display = 'none';
+            }
+
+            $('water-level').textContent = s.water_level !== undefined && s.water_level !== null ? s.water_level + ' ft' : '--';
+            // Treat null and undefined as missing (stations without full
+            // NWPS categories have null moderate/major; never show "null ft")
+            const fmtFt = v => (v !== undefined && v !== null) ? v + ' ft' : '--';
+            $('action-stage').textContent = fmtFt(s.action_stage);
+            $('minor-stage').textContent = fmtFt(s.minor_stage);
+            $('moderate-stage').textContent = fmtFt(s.moderate_stage);
+            $('major-stage').textContent = fmtFt(s.major_stage);
+            $('flood-extent').textContent = s.flood_extent || (
+                s.flood_extent_status === 'not_detected'
+                    ? 'Not detected (no inundation map)'
+                    : '--'
+            );
+            $('flood-extent').title = s.flood_extent_status === 'not_detected'
+                ? 'No satellite flood extent detected/available; inundation-dependent analysis (map, areal exposure) was skipped.'
+                : '';
+            $('alerts').textContent = s.alerts || '--';
+
+            // Derived
+            $('population-total').textContent = s.population_total ? s.population_total.toLocaleString() : '--';
+            // Affected population: prefers the tract-centroid ∩ flood
+            // area estimate; falls back to the containing tract population
+            const affectedPop = s.population_affected ?? s.population_exposure;
+            $('population-affected').textContent = affectedPop ? affectedPop.toLocaleString() : '--';
+            $('buildings').textContent = s.infrastructure_counts?.affected_buildings ?? '--';
+            $('facilities').textContent = s.infrastructure_counts?.affected_facilities ?? '--';
+            $('roads').textContent = s.infrastructure_counts?.affected_roads ?? '--';
+            $('bridges').textContent = s.infrastructure_counts?.affected_bridges ?? '--';
+            $('svi-value').textContent = s.svi !== undefined && s.svi !== null ? s.svi.toFixed(4) : '--';
+            // CDRI: percent + relative-risk band
+            const di = s.decision_indices || {};
+            if (di.cdri_percent !== undefined && di.cdri_percent !== null) {
+                const riskLabel = di.cdri_risk_label || '';
+                $('cdri').textContent = `${di.cdri_percent}% · ${riskLabel}`;
+            } else {
+                $('cdri').textContent = di.cdri !== undefined && di.cdri !== null ? (di.cdri * 100).toFixed(2) + '%' : '--';
+            }
+            $('eps').textContent = s.decision_indices?.eps?.toFixed?.(3) ?? '--';
+            $('data-confidence').textContent = s.decision_indices?.data_confidence?.toFixed?.(3) ?? '--';
+            
+            // Load the GIS map (flood extent + routing render): set the
+            // iframe src dynamically, show the modal, keep a reopen button
+            const gisBtn = document.getElementById('gis-map-btn');
+            const gisModal = document.getElementById('gis-map-modal');
+            const mapIframe = document.getElementById('gis-map-iframe');
+            if (data.gis_map_url) {
+                // Reset to blank first so the same URL still forces a reload
+                mapIframe.src = 'about:blank';
+                mapIframe.src = data.gis_map_url;
+                gisBtn.style.display = 'block';
+                gisModal.classList.add('open');
+            } else {
+                mapIframe.src = 'about:blank';
+                gisBtn.style.display = 'none';
+                gisModal.classList.remove('open');
+            }
+
+            // Status Badge
+            const badgeSpan = document.querySelector('#status-badge .badge');
+            const wl = s.water_level;
+            const action = s.action_stage;
+            let statusText = '--', badgeClass = 'badge-unknown';
+            if (wl !== undefined && action !== undefined && wl !== null && action !== null) {
+                if (wl < action) {
+                    statusText = 'Normal';
+                    badgeClass = 'badge-normal';
+                } else if (wl < (s.minor_stage || Infinity)) {
+                    statusText = 'Watch';
+                    badgeClass = 'badge-warning';
+                } else {
+                    statusText = 'Danger';
+                    badgeClass = 'badge-danger';
+                }
+            }
+            badgeSpan.textContent = statusText;
+            badgeSpan.className = 'badge ' + badgeClass;
+
+            // Recommendation
+            const nextAction = $('next-action-text');
+            if (data.report) {
+                const lines = data.report.split('\n');
+                let found = false;
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].toLowerCase().includes('recommended')) {
+                        const nextLine = lines[i+1]?.trim();
+                        if (nextLine && !nextLine.startsWith('===')) {
+                            nextAction.textContent = nextLine;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    if (wl !== undefined && action !== undefined && wl < action) {
+                        nextAction.textContent = 'Water level below action stage. No urgent action needed.';
+                    } else if (wl !== undefined && action !== undefined && wl >= action) {
+                        nextAction.textContent = 'Water level exceeds action stage. Consider monitoring.';
+                    } else {
+                        nextAction.textContent = 'Check latest observation and thresholds.';
+                    }
+                }
+            } else {
+                nextAction.textContent = 'No report available.';
+            }
+        }
+
+        // ------------------------------------------------------------
+        //  Update Map
+        // ------------------------------------------------------------
+        const overlayLayer = L.layerGroup().addTo(map);
+        // Layer-control reference: remove the old control on each run,
+        // otherwise controls stack up and stale ones point at cleared
+        // layerGroups (dead switches).
+        let overlayControl = null;
+
+        async function updateMap(data) {
+            markerLayer.clearLayers();
+            overlayLayer.clearLayers();
+            if (overlayControl) {
+                map.removeControl(overlayControl);
+                overlayControl = null;
+            }
+            // Also clear note banners inserted into the GIS modal by the
+            // previous run (no-hazard / unverified detection).
+            document.querySelectorAll('.gis-note').forEach(el => el.remove());
+            const s = data?.structured || {};
+            const lat = s.target_lat || s.station_lat;
+            const lon = s.target_lon || s.station_lon;
+
+            if (s.target_lat && s.target_lon) {
+                const marker = L.marker([s.target_lat, s.target_lon], { icon: redMarker })
+                    .addTo(markerLayer)
+                    .bindPopup(`<b>${s.target_name || 'Target'}</b><br>${s.target_lat.toFixed(5)}, ${s.target_lon.toFixed(5)}`);
+            }
+            if (s.station_lat && s.station_lon && (s.station_lat !== s.target_lat || s.station_lon !== s.target_lon)) {
+                const m2 = L.marker([s.station_lat, s.station_lon], { icon: blueMarker })
+                    .addTo(markerLayer)
+                    .bindPopup(`<b>${s.station_name || s.station_id || 'Gauge station'}</b><br>Water: ${s.water_level || '--'} ft`);
+            }
+
+            if (s.analysis_radius_km && lat && lon) {
+                L.circle([lat, lon], { radius: s.analysis_radius_km * 1000, color: '#6c757d', weight: 1, fillOpacity: 0.03, dashArray: '5 5' })
+                    .addTo(markerLayer).bindTooltip(`Fusion analysis buffer (${s.analysis_radius_km} km) — data look-back radius, not the city boundary`);
+            }
+            (s.osm_facilities || []).forEach(f => {
+                if (f.latitude == null || f.longitude == null) return;
+                const label = f.name || `${String(f.type || 'Facility').replaceAll('_', ' ')} · OSM ${f.id}`;
+                L.circleMarker([f.latitude, f.longitude], { radius: 5, color: '#198754', fillOpacity: .8 })
+                    .addTo(markerLayer).bindPopup(`<b>${label}</b><br>${f.type || 'facility'}`);
+            });
+
+            // ── Spatial overlays: flood extent / affected buildings / rescue route ──
+            // When the gauge contradicts the satellite detection (in-bank
+            // water vs. a large water footprint) or the footprint is
+            // implausible, layer names downgrade to "unverified satellite
+            // detection".
+            const layers = data?.gis_layers || {};
+            const noActiveHazard = data.active_hazard === false;
+            const unverified = (data.sar_stage_contradiction === true
+                                || data.sar_implausible === true);
+            const floodLayerName = unverified
+                ? '🟦 Satellite-detected surface water (unverified — contradicts in-bank gauge)'
+                : '🟥 Flood extent';
+            const bldLayerName = unverified
+                ? '🟨 Buildings inside detected footprint (unverified)'
+                : '🟨 Affected buildings';
+            // No active hazard and no flood layers: say so explicitly (not an empty panel)
+            const noFloodLayers = !layers.flood_extent_url;
+            if (noActiveHazard && noFloodLayers) {
+                const calm = document.createElement('div');
+                calm.className = 'gis-note';
+                calm.style.cssText = 'background:#E8F5E9;border:1px solid #A5D6A7;padding:8px 10px;margin:6px 0;border-radius:6px;font-size:12px;';
+                calm.innerHTML = '<b>✓ No flooding detected</b> — gauge within banks; no fresh satellite water footprint in the look-back window (or a contradictory footprint was rejected as implausible). CDRI/EPS = 0 by the water-primary rule.';
+                const iframe2 = document.getElementById('gis-map-iframe');
+                if (iframe2 && iframe2.parentNode) {
+                    iframe2.parentNode.insertBefore(calm, iframe2.nextSibling);
+                }
+            }
+            const layerSpecs = [
+                { url: layers.flood_extent_url, name: floodLayerName,
+                  style: unverified
+                      ? { color: '#4477AA', weight: 2, fillColor: '#7FA8D9', fillOpacity: 0.3 }
+                      : { color: '#CC0000', weight: 2, fillColor: '#FF4444', fillOpacity: 0.35 } },
+                { url: layers.affected_buildings_url, name: bldLayerName,
+                  style: { color: '#FFA500', weight: 1, fillColor: '#FFD700', fillOpacity: 0.7 }, point: true },
+                { url: layers.rescue_route_url, name: '🟦 Rescue route', style: { color: '#1565C0', weight: 5, opacity: 0.9 } },
+                { url: layers.poi_url, name: '🔵 POI (hospital/shelter)', style: { color: '#009688', weight: 2, fillOpacity: 0.8 }, point: true },
+                { url: layers.context_extent_url, name: '🟪 Detected water in 30-km buffer (unverified — no in-city overlap)', style: { color: '#7B1FA2', weight: 2, dashArray: '6 4', fillColor: '#CE93D8', fillOpacity: 0.15 } },
+            ];
+            // Per-layer toggles: routes/POIs are tiny at city zoom and must be highlightable individually
+            const overlayGroups = {};
+            if (unverified) {
+                const banner = document.createElement('div');
+                banner.className = 'gis-note';
+                banner.style.cssText = 'background:#FFF3CD;border:1px solid #FFA000;padding:8px 10px;margin:6px 0;border-radius:6px;font-size:12px;';
+                banner.innerHTML = '<b>⚠ Unverified satellite detection</b> — the gauge reads at/below action stage while change detection reports surface water. Layers below are <i>satellite-detected surface water</i>, not confirmed flooding. Verify imagery before acting.';
+                const iframe = document.getElementById('gis-map-iframe');
+                if (iframe && iframe.parentNode) {
+                    // Below the modal's iframe
+                    iframe.parentNode.insertBefore(banner, iframe.nextSibling);
+                }
+            }
+            let overlayCount = 0;
+            for (const spec of layerSpecs) {
+                if (!spec.url) continue;
+                try {
+                    const resp = await fetch(spec.url);
+                    if (!resp.ok) continue;
+                    const geojson = await resp.json();
+                    if (!geojson || !(geojson.features || []).length) continue;
+                    const g = L.layerGroup().addTo(overlayLayer);
+                    L.geoJSON(geojson, {
+                        style: () => spec.style,
+                        pointToLayer: spec.point
+                            ? (_, latlng) => L.circleMarker(latlng, { radius: 5, ...spec.style })
+                            : undefined,
+                        onEachFeature: (feature, lyr) => {
+                            const name = feature.properties?.name || feature.properties?.amenity || '';
+                            if (name) lyr.bindPopup(`<b>${name}</b>`);
+                        }
+                    }).addTo(g);
+                    overlayGroups[spec.name] = g;
+                    overlayCount++;
+                } catch (e) { /* one layer failing must not block the rest */ }
+                // Routes are only a few pixels at city zoom; the per-layer
+                // toggles serve as the highlight affordance.
+            }
+
+            if (Object.keys(overlayGroups).length) {
+                overlayControl = L.control.layers(null, overlayGroups, { collapsed: false, position: 'topleft' }).addTo(map);
+            }
+
+            // View: merge all sub-layer bounds (nested layerGroups need
+            // per-layer getBounds) and force-include the target point so
+            // the view lands on the target area after each assessment.
+            let overlayBounds = null;
+            overlayLayer.eachLayer(grp => {
+                try {
+                    const gb = (grp.getBounds && grp.getBounds()) || null;
+                    if (gb && gb.isValid()) {
+                        overlayBounds = overlayBounds
+                            ? overlayBounds.extend(gb) : gb;
+                    }
+                } catch (err) { /* some layers have no bounds (e.g. empty groups) */ }
+            });
+            if (lat != null && lon != null) {
+                const tp = L.latLng(lat, lon);
+                overlayBounds = overlayBounds
+                    ? overlayBounds.extend(tp) : L.latLngBounds(tp, tp);
+            }
+            if (overlayBounds && overlayBounds.isValid()) {
+                map.fitBounds(overlayBounds, { padding: [50, 50], maxZoom: 14 });
+            } else {
+                const group = L.featureGroup(markerLayer.getLayers());
+                if (group.getLayers().length > 0) {
+                    map.fitBounds(group.getBounds(), { padding: [50, 50], maxZoom: 14 });
+                } else if (lat && lon) {
+                    map.setView([lat, lon], 12);
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        //  Submit Query
+        // ------------------------------------------------------------
+        function showError(message) {
+            document.getElementById('error-detail').textContent = message;
+            document.getElementById('error-modal').style.display = 'flex';
+        }
+
+        async function submitQuery(demo) {
+            const query = queryInput.value.trim();
+            if (!query) return;
+
+            // Optional event date: empty = real-time assessment; a past
+            // date = historical replay (strict time alignment: gauge
+            // queried over the event window, live-only sources dropped).
+            // A text input, not a native date picker: the native calendar
+            // popover is browser-positioned and gets clipped in the
+            // bottom-docked query bar.
+            const rawDate = document.getElementById('event-date').value.trim();
+            let eventDate = rawDate || null;
+            if (eventDate && !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
+                showError('Event date must be in YYYY-MM-DD format (e.g., 2017-08-27), or left empty for real-time assessment.');
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = demo ? '⏳ Demo...' : '⏳ Assessing...';
+            loadingOverlay.classList.add('active');
+            document.getElementById('map').classList.add('loading');
+
+            try {
+                const resp = await fetch('/api/assess', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query, event_date: eventDate, demo: !!demo })
+                });
+                let data = null;
+                try { data = await resp.json(); } catch (_) {}
+                if (!resp.ok) {
+                    showError(
+                        (data && (data.detail || data.error)) ||
+                        `HTTP ${resp.status} — assessment failed on the server. ` +
+                        'Check the server log for the traceback.'
+                    );
+                    return;
+                }
+                // 200 with status=error: empty structured data is not "no
+                // hazard"; surface the failure reason (full explanation
+                // stays in the Full Decision Report).
+                if (data && data.status === 'error') {
+                    updateUI(data);
+                    updateMap(data);
+                    updatePanel(data);
+                    showError(
+                        data.error_detail ||
+                        'The assessment ended in error status — no evidence ' +
+                        'was produced. See Full Decision Report for details.'
+                    );
+                    return;
+                }
+                updateUI(data);
+                updateMap(data);
+                updatePanel(data);
+                lastRunId = data.run_id || null;
+                infoPanel.style.display = 'block';
+            } catch (e) {
+                showError('Request failed: ' + e.message);
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Execute';
+                loadingOverlay.classList.remove('active');
+                document.getElementById('map').classList.remove('loading');
+            }
+        }
+
+        // ------------------------------------------------------------
+        //  Right panel: raw data / lambda+Pareto / status+decision
+        // ------------------------------------------------------------
+        let lastFrontierCurve = [];
+        // run_id of the latest assessment: attached to lambda-slider and
+        // HITL submissions so concurrent runs never cross data.
+        let lastRunId = null;
+
+        function updatePanel(data) {
+            const s = data?.structured || {};
+
+            // ── Section 1 · Fused Evidence (values + conflict flags + rejected sources) ──
+            const fm = s.fused_measurements || {};
+            const rejected = s.rejected_sources || [];
+            let rawHtml = '';
+            const varNames = Object.keys(fm);
+            if (varNames.length) {
+                rawHtml += varNames.map(k => {
+                    const m = fm[k] || {};
+                    const conflict = m.conflict
+                        ? `<span class="conflict-flag" title="sources disagree (ratio ${(m.conflict_ratio ?? '?')})">CONFLICT ${(m.conflict_ratio ?? '')}</span>` : '';
+                    const srcVals = m.conflict && m.source_values
+                        ? '<div style="font-size:11px;color:#833;">' +
+                          Object.entries(m.source_values).map(
+                              ([src, v]) => `${src}: ${v}`).join(' · ') + '</div>'
+                        : '';
+                    return `<div class="fusion-var">
+                        <span class="name">${k}</span> =
+                        <strong>${m.value ?? '--'}</strong> ${m.unit || ''}
+                        <span style="color:#777;font-size:11px;">(${m.source_count || 0} src)</span>
+                        ${conflict}${srcVals}
+                    </div>`;
+                }).join('');
+            } else {
+                rawHtml += '<div style="color:#777;">No fused measurements.</div>';
+            }
+            if (rejected.length) {
+                rawHtml += `<div style="margin-top:8px;"><strong>Rejected sources</strong>` +
+                    rejected.map(r => `<div class="fusion-var" style="color:#a33;">✕ ${r.source || '?'} — ${(r.reason || '').slice(0, 80)}</div>`).join('') + '</div>';
+            }
+            $('fused-list').innerHTML = rawHtml;
+
+            // ── Section 2 · lambda slider + Pareto scatter + plan detail ──
+            // No-hazard days (in-bank gauge, CDRI=0): no dispatch
+            // recommendation — the panel degrades to a pre-positioning note.
+            const ropt = s.resource_optimization || {};
+            const ledger = ropt.equity_ledger || {};
+            lastFrontierCurve = ledger.frontier_equity_curve || [];
+            if (data.status === 'error') {
+                // Failed run: not "no hazard"; never show the green no-hazard box
+                $('pareto-suppressed').style.display = 'none';
+                $('pareto-scatter').innerHTML =
+                    '<div style="color:#777;">Assessment failed — no analysis output.</div>';
+                $('lambda-box').style.display = 'none';
+                $('plan-detail').style.display = 'none';
+                $('lambda-result').textContent = '';
+            } else if (data.active_hazard === false) {
+                // No-hazard day: no dispatch recommendation — pre-positioning note only
+                $('pareto-suppressed').style.display = 'block';
+                $('pareto-scatter').innerHTML =
+                    '<div style="color:#777;">No active hazard — no allocation recommendation. '
+                    + 'Use the Demo run for a pre-positioning analysis of the frontier.</div>';
+                $('lambda-box').style.display = 'none';
+                $('plan-detail').style.display = 'none';
+                $('lambda-result').textContent = '';
+            } else {
+                $('pareto-suppressed') && ($('pareto-suppressed').style.display = 'none');
+                renderParetoScatter(lastFrontierCurve, ropt.recommended_plan_id);
+                if (lastFrontierCurve.length) {
+                    $('lambda-box').style.display = 'block';
+                    const rec = lastFrontierCurve.find(
+                        p => p.plan_id === ropt.recommended_plan_id
+                    ) || lastFrontierCurve[0];
+                    if (rec) renderPlanDetail(rec);
+                } else {
+                    $('lambda-box').style.display = 'none';
+                    $('plan-detail').style.display = 'none';
+                    $('lambda-result').textContent = '';
+                }
+            }
+
+            // ── Section 3 · decision extras (uncertainty + data gaps) + full report ──
+            const di = s.decision_indices || {};
+            const unc = di.uncertainty || {};
+            let decHtml = '';
+            if (unc.top_components && unc.top_components.length) {
+                decHtml += `<div class="uncertainty-box">±10% component envelope: CDRI ∈ [${(unc.interval_percent || [0,0])[0]}%, ${(unc.interval_percent || [0,0])[1]}%]<br>Most sensitive: <strong>${unc.top_components.join(', ')}</strong></div>`;
+            }
+            if (di.data_gaps && di.data_gaps.length) {
+                decHtml += `<div style="color:#a15c00;">⚠ data gaps: ${di.data_gaps.join(', ')}</div>`;
+            }
+            $('decision-extras').innerHTML = decHtml;
+            $('report-text').textContent = data.report || 'No report generated.';
+        }
+
+        function renderParetoScatter(curve, recommendedId) {
+            const host = $('pareto-scatter');
+            const valid = (curve || []).filter(
+                p => p.cost != null && p.vulnerability_weighted_unmet_need != null
+            );
+            if (!valid.length) {
+                host.innerHTML = '<div style="color:#777;">No Pareto frontier equity data (needs flood extent + SVI).</div>';
+                return;
+            }
+            const W = 320, H = 200, PAD = 34;
+            const xs = valid.map(p => p.cost), ys = valid.map(p => p.vulnerability_weighted_unmet_need);
+            const xMin = Math.min(...xs), xMax = Math.max(...xs), yMin = 0, yMax = Math.max(...ys) * 1.1 || 1;
+            const sx = c => PAD + (W - 2 * PAD) * ((c - xMin) / (xMax - xMin || 1));
+            const sy = v => H - PAD - (H - 2 * PAD) * ((v - yMin) / (yMax - yMin || 1));
+            // Color: greener = higher SVI coverage
+            const vcMin = Math.min(...valid.map(p => p.vulnerability_coverage ?? 0));
+            const vcMax = Math.max(...valid.map(p => p.vulnerability_coverage ?? 0));
+            const color = p => {
+                const t = ((p.vulnerability_coverage ?? 0) - vcMin) / (vcMax - vcMin || 1);
+                const r = Math.round(214 - t * 158), g = Math.round(90 + t * 108), b = Math.round(90 + t * 20);
+                return `rgb(${r},${g},${b})`;
+            };
+            let svg = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-height:220px;">
+                <text x="${W/2}" y="${H-6}" text-anchor="middle" font-size="10" fill="#666">economic cost (dispatch burden) →</text>
+                <text x="10" y="${H/2}" text-anchor="middle" font-size="10" fill="#666" transform="rotate(-90 10 ${H/2})">VWUN (unmet need) ↑</text>
+                <line x1="${PAD}" y1="${H-PAD}" x2="${W-8}" y2="${H-PAD}" stroke="#ccd" stroke-width="1"/>
+                <line x1="${PAD}" y1="8" x2="${PAD}" y2="${H-PAD}" stroke="#ccd" stroke-width="1"/>`;
+            valid.forEach(p => {
+                const rec = p.plan_id === recommendedId;
+                svg += `<circle class="pareto-point" data-plan="${p.plan_id}"
+                    cx="${sx(p.cost)}" cy="${sy(p.vulnerability_weighted_unmet_need)}" r="${rec ? 9 : 6}"
+                    fill="${color(p)}" fill-opacity=".85" stroke="${rec ? '#c62828' : 'none'}" stroke-width="2">
+                    <title>${p.plan_id}\ncost ${p.cost} · VWUN ${p.vulnerability_weighted_unmet_need}\nSVI coverage ${p.vulnerability_coverage ?? '--'}</title>
+                </circle>`;
+            });
+            svg += '</svg><div style="font-size:11px;color:#666;">click a point to inspect the plan · red ring = recommended · greener = higher SVI coverage</div>';
+            host.innerHTML = svg;
+            host.querySelectorAll('.pareto-point').forEach(el => {
+                el.addEventListener('click', () => {
+                    const plan = lastFrontierCurve.find(p => p.plan_id === el.dataset.plan);
+                    if (plan) renderPlanDetail(plan);
+                });
+            });
+        }
+
+        function renderPlanDetail(p) {
+            const box = $('plan-detail');
+            box.style.display = 'block';
+            const covered = (p.covered_tract_ids || []);
+            const highSvi = (p.covered_high_svi_tract_ids || []);
+            box.innerHTML = `
+                <strong>${p.plan_id}</strong>
+                <div>💸 Economic cost (dispatch burden): <strong>${p.cost ?? '--'}</strong></div>
+                <div>🤝 Vulnerability-weighted unmet need (VWUN): <strong>${p.vulnerability_weighted_unmet_need ?? '--'}</strong></div>
+                <div>⚖️ Equity gap (high−low SVI coverage): <strong>${p.equity_gap ?? '--'}</strong></div>
+                <div>🛡️ SVI-weighted coverage: <strong>${p.vulnerability_coverage ?? '--'}</strong></div>
+                <div style="margin-top:6px;"><strong>Protected communities (${covered.length}):</strong>
+                    <div class="tract-list">${covered.length ? covered.join(', ') : 'none'}</div>
+                </div>
+                ${highSvi.length ? `<div style="margin-top:4px;color:#2e7d32;"><strong>High-SVI tracts prioritized:</strong> <span class="tract-list">${highSvi.join(', ')}</span></div>` : ''}
+            `;
+        }
+
+        // Live lambda recalc: slider drag recomputes VWUN / equity gap
+        // without rerunning the pipeline.
+        let lambdaTimer = null;
+        $('lambda-slider').addEventListener('input', (e) => {
+            const lam = parseFloat(e.target.value);
+            $('lambda-val').textContent = lam.toFixed(1);
+            $('lambda-result').innerHTML = '<span style="color:#777;">recalculating…</span>';
+            clearTimeout(lambdaTimer);
+            lambdaTimer = setTimeout(async () => {
+                try {
+                    const resp = await fetch('/api/equity/sensitivity', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ vulnerability_weight: lam, run_id: lastRunId })
+                    });
+                    const d = await resp.json();
+                    if (!resp.ok) {
+                        $('lambda-result').textContent = d.detail || 'unavailable';
+                        return;
+                    }
+                    let html =
+                        `VWUN(λ=${lam.toFixed(1)}) = <strong>${d.vulnerability_weighted_unmet_need.toLocaleString()}</strong> · ` +
+                        `equity gap = <strong>${d.equity_gap}</strong> · ` +
+                        `covered tracts ${d.covered_tract_count}/${d.demand_tract_count}`;
+                    // Frontier preview: who wins the full frontier at this
+                    // lambda — would the recommendation flip?
+                    const fp = d.frontier_preview;
+                    if (fp && fp.would_recommend) {
+                        const plans = Object.entries(fp.vwun_by_plan || {})
+                            .map(([id, v]) => `${id}: ${v.toLocaleString()}`)
+                            .join(' · ');
+                        const flip = fp.recommendation_changed
+                            ? `<span style="color:#c0392b;">⚠ recommendation would flip → ${fp.would_recommend}</span>`
+                            : `<span style="color:#1e8e3e;">recommendation stays: ${fp.would_recommend}</span>`;
+                        html += `<br>frontier VWUN — ${plans}<br>${flip}`;
+                    }
+                    $('lambda-result').innerHTML = html;
+                } catch (err) {
+                    $('lambda-result').textContent = 'sensitivity endpoint unreachable';
+                }
+            }, 200);
+        });
+
+        // Events
+        submitBtn.addEventListener('click', () => submitQuery(false));
+        document.getElementById('submit-demo').addEventListener('click', () => submitQuery(true));
+        queryInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') submitQuery(false); });
+
+        // GIS map overlay controls
+        document.getElementById('gis-map-close').addEventListener('click', () => {
+            document.getElementById('gis-map-modal').classList.remove('open');
+        });
+        document.getElementById('gis-map-btn').addEventListener('click', () => {
+            const iframe = document.getElementById('gis-map-iframe');
+            if (iframe.src && iframe.src !== 'about:blank' && !iframe.src.endsWith('about:blank')) {
+                document.getElementById('gis-map-modal').classList.add('open');
+            }
+        });
+        document.getElementById('gis-map-modal').addEventListener('click', (e) => {
+            if (e.target === e.currentTarget) {
+                e.currentTarget.classList.remove('open');
+            }
+        });
+
+        // No auto-run
+    </script>
+    
+    <!-- HITL modal -->
+    <div id="hitl-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:10000; justify-content:center; align-items:center;">
+        <div style="background:white; border-radius:12px; padding:30px; max-width:500px; width:90%; box-shadow:0 4px 24px rgba(0,0,0,0.3);">
+            <h3 id="hitl-title">Human-in-the-Loop Required</h3>
+            <p id="hitl-question" style="margin:12px 0; font-size:16px;">Question</p>
+            <div id="hitl-sliders"></div>
+            <input type="text" id="hitl-input" style="width:100%; padding:10px; border:1px solid #ccc; border-radius:6px; font-size:16px; margin-bottom:12px;" placeholder="Enter value (or leave empty to use default)">
+            <div style="display:flex; gap:12px;">
+                <button id="hitl-submit-btn" style="flex:2; padding:10px; background:#4a90e2; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:600;">Modify / Continue</button>
+                <button id="hitl-cancel-btn" style="flex:1; padding:10px; background:#e0e0e0; color:#333; border:none; border-radius:6px; cursor:pointer;">Continue with default</button>
+            </div>
+            <p id="hitl-proposed" style="margin-top:8px; font-size:13px; color:#666;"></p>
+        </div>
+    </div>
+
+    <script>
+        // HITL polling
+        let hitlPollingInterval = null;
+        // Run this modal belongs to; sent back so the server routes the answer precisely
+        let pendingHitlRunId = null;
+
+        async function checkHITL() {
+            try {
+                const resp = await fetch('/api/hitl/status');
+                const data = await resp.json();
+                if (data.has_pending && data.request) {
+                    pendingHitlRunId = data.run_id || null;
+                    showHITLModal(data.request);
+                }
+            } catch (e) {
+                // Ignore network errors
+            }
+        }
+
+        // When the checkpoint context carries adjustable_parameters,
+        // render sliders (lambda etc.) and submit them as a JSON override
+        // (matches the backend hitl_parameters_overridden)
+        let hitlAdjustables = null;
+
+        function showHITLModal(request) {
+            const modal = document.getElementById('hitl-modal');
+            document.getElementById('hitl-title').textContent = '🔔 ' + request.reason;
+            document.getElementById('hitl-question').textContent = request.question;
+            document.getElementById('hitl-proposed').textContent = request.proposed_value !== null && request.proposed_value !== undefined
+                ? '💡 Default: ' + request.proposed_value + ' — continue to accept it, or edit the value to modify it.'
+                : '💡 No default value (custom input required)';
+            document.getElementById('hitl-input').value = request.proposed_value || '';
+            modal.style.display = 'flex';
+
+            // Sliders (lambda / thresholds): preferred when structured adjustable parameters exist
+            const slidersBox = document.getElementById('hitl-sliders');
+            hitlAdjustables = (request.context && request.context.adjustable_parameters) || null;
+            if (hitlAdjustables && hitlAdjustables.length) {
+                slidersBox.style.display = 'block';
+                slidersBox.innerHTML = hitlAdjustables.map(a => `
+                    <div class="hitl-slider-row">
+                        <label>${a.label || a.key} <span class="val" id="hitl-${a.key}-val">${a.default}</span></label>
+                        <input type="range" id="hitl-${a.key}" min="${a.min}" max="${a.max}" step="${a.step}" value="${a.default}">
+                    </div>`).join('');
+                hitlAdjustables.forEach(a => {
+                    const el = document.getElementById('hitl-' + a.key);
+                    el.addEventListener('input', () => {
+                        document.getElementById('hitl-' + a.key + '-val').textContent = el.value;
+                    });
+                });
+                document.getElementById('hitl-input').style.display = 'none';
+            } else {
+                slidersBox.style.display = 'none';
+                slidersBox.innerHTML = '';
+                document.getElementById('hitl-input').style.display = 'block';
+            }
+
+            if (hitlPollingInterval) {
+                clearInterval(hitlPollingInterval);
+                hitlPollingInterval = null;
+            }
+        }
+
+        function hideHITLModal() {
+            document.getElementById('hitl-modal').style.display = 'none';
+            if (!hitlPollingInterval) {
+                hitlPollingInterval = setInterval(checkHITL, 2000);
+            }
+        }
+
+        async function submitHITLResponse(value) {
+            try {
+                await fetch('/api/hitl/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ value: value, run_id: pendingHitlRunId })
+                });
+            } catch (e) {}
+            hideHITLModal();
+        }
+
+        document.getElementById('hitl-submit-btn').addEventListener('click', () => {
+            // Slider mode: submit a JSON override {key: value}; text mode: submit as-is
+            if (hitlAdjustables && hitlAdjustables.length) {
+                const overrides = {};
+                hitlAdjustables.forEach(a => {
+                    overrides[a.key] = parseFloat(
+                        document.getElementById('hitl-' + a.key).value
+                    );
+                });
+                submitHITLResponse(JSON.stringify(overrides));
+                return;
+            }
+            const val = document.getElementById('hitl-input').value.trim();
+            submitHITLResponse(val || null);
+        });
+
+        document.getElementById('hitl-cancel-btn').addEventListener('click', () => {
+            submitHITLResponse(null);
+        });
+
+        // Start polling on page load
+        window.addEventListener('load', function() {
+            if (!hitlPollingInterval) {
+                hitlPollingInterval = setInterval(checkHITL, 2000);
+            }
+        });
+    </script>
+</body>
+</html>
