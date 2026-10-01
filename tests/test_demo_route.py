@@ -113,3 +113,38 @@ async def test_demo_rescue_route_follows_street_network():
         "医院位于 demo 洪水多边形内：首选避洪路径应 no_path_found，"
         "回退路线必须以 route_avoids_flood=False 披露"
     )
+
+
+def test_demo_road_cache_reader_accepts_both_edge_layouts(tmp_path, monkeypatch):
+    """The cache builder writes 5-element edges [u, v, length, coords,
+    attrs]; older caches have 4. The reader must accept both so a
+    rebuilt cache cannot silently degrade the demo rescue route to the
+    synthetic grid."""
+    from app import demo_fixtures
+
+    payload = {
+        "meta": {"source": "test cache"},
+        "nodes": {"a": [29.5, -95.20], "b": [29.5, -95.19]},
+        "edges": [
+            [
+                "a",
+                "b",
+                770.0,
+                None,
+                {"speed_kph": 50, "capacity_vph": 900, "blocked": False},
+            ],
+            ["b", "a", 770.0],
+        ],
+    }
+    path = tmp_path / "roads.json"
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(demo_fixtures, "_DEMO_ROAD_CACHE_PATH", str(path))
+    monkeypatch.setattr(demo_fixtures, "_demo_road_cache", None)
+    monkeypatch.setattr(demo_fixtures, "_demo_road_cache_loaded", False)
+
+    loaded = demo_fixtures._load_demo_road_cache()
+    assert loaded is not None
+    nodes, adj = loaded
+    assert set(nodes) == {"a", "b"}
+    assert adj["a"] == [("b", 770.0, None)]
+    assert adj["b"] == [("a", 770.0, None)]

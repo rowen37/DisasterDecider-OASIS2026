@@ -143,7 +143,7 @@
             border-bottom: 1px solid #f0f2f5;
         }
         .stat-label { color: #555; font-weight: 500; }
-        .stat-value { font-weight: 600; color: #1a3c5e; word-break: break-word; }
+        .stat-value { font-weight: 600; color: #1a3c5e; word-break: break-word; text-align: right; margin-left: 12px; }
         .forecast-entry { padding: 4px 0; border-bottom: 1px solid #e8eaed; }
         .forecast-entry:last-child { border-bottom: none; }
         .forecast-entry .period { font-weight: 600; color: #1a3c5e; text-align: right; }
@@ -172,7 +172,16 @@
         .conflict-flag { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:9px; background:#ffcdd2; color:#c62828; font-size:10px; font-weight:700; }
         .pareto-point { cursor: pointer; }
         .pareto-point:hover { stroke: #000; stroke-width: 2; }
-        .plan-detail { margin-top: 8px; padding: 8px; background: #f6f9fc; border-radius: 6px; border: 1px solid #dde5ee; font-size: 12px; }
+        .plan-detail { margin-top: 8px; padding: 10px; background: #f6f9fc; border-radius: 6px; border: 1px solid #dde5ee; font-size: 12px; }
+        .plan-detail-title { color:#1a3c5e; font-size:13px; font-weight:700; margin-bottom:6px; }
+        .plan-metric { display:flex; justify-content:space-between; gap:10px; padding:3px 0; border-bottom:1px solid #e8edf3; }
+        .plan-metric:last-of-type { border-bottom:none; }
+        .plan-metric-label { color:#4b5966; }
+        .plan-metric-value { color:#1a3c5e; font-weight:600; text-align:right; }
+        .metric-secondary { color:#657584; font-weight:400; white-space:nowrap; }
+        .plan-subsection { margin-top:8px; padding:7px 8px; background:#fff; border-left:3px solid #c7d4e2; border-radius:3px; }
+        .plan-subsection-title { color:#5c6873; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.25px; }
+        .plan-subsection-value { color:#555; font-size:11px; margin-top:3px; }
         .plan-detail .tract-list { font-family: ui-monospace, monospace; font-size: 11px; color: #444; margin-top: 4px; }
         .lambda-box { padding: 8px; background: #f0f7ff; border-radius: 6px; margin-top: 8px; font-size: 12px; }
         .lambda-box input[type=range] { width: 100%; }
@@ -407,7 +416,7 @@
                 <div class="collapsible-content collapsed" id="forecast-periods"></div>
             </div>
             <div class="stat-row">
-                <span class="stat-label">Water Level</span>
+                <span class="stat-label" id="water-level-label">Water Level</span>
                 <span class="stat-value" id="water-level">--</span>
             </div>
 
@@ -436,7 +445,7 @@
                 <span class="stat-value" id="flood-extent">--</span>
             </div>
             <div class="stat-row">
-                <span class="stat-label">Active Alerts</span>
+                <span class="stat-label">Alerts at target point</span>
                 <span class="stat-value" id="alerts">--</span>
             </div>
         </div>
@@ -448,7 +457,7 @@
         </div>
         <div class="collapsible-content" id="derived-content">
             <div class="stat-row">
-                <span class="stat-label" title="Total population of the census tracts returned by the CDC/ATSDR SVI service within its configured radius">Population (SVI tracts)</span>
+                <span class="stat-label" id="population-scope-label">Population (SVI tracts)</span>
                 <span class="stat-value" id="population-total">--</span>
             </div>
             <div class="stat-row">
@@ -467,24 +476,24 @@
                     <span class="stat-value" id="facilities">--</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Affected roads</span>
+                    <span class="stat-label" title="Routing-graph edges excluded while avoiding the flood polygon; not a count of every flooded road or a confirmed closure">Flood-excluded route links</span>
                     <span class="stat-value" id="roads">--</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Affected bridges</span>
+                    <span class="stat-label" title="Bridge exposure is not calculated by the current GIS pipeline">Affected bridges</span>
                     <span class="stat-value" id="bridges">--</span>
                 </div>
             </div>
 
             <div class="stat-row">
-                <span class="stat-label">SVI (pop‑weighted)</span>
+                <span class="stat-label" id="svi-scope-label">SVI (pop‑weighted)</span>
                 <span class="stat-value" id="svi-value">--</span>
             </div>
             <div class="sub-group">
                 <div class="group-label">Decision indices (0–1)</div>
-                <div class="stat-row"><span class="stat-label">CDRI</span><span class="stat-value" id="cdri">--</span></div>
-                <div class="stat-row"><span class="stat-label">EPS</span><span class="stat-value" id="eps">--</span></div>
-                <div class="stat-row"><span class="stat-label">Data confidence</span><span class="stat-value" id="data-confidence">--</span></div>
+                <div class="stat-row"><span class="stat-label" title="Gauge-stage based screening score; local satellite water and alerts are shown separately.">CDRI</span><span class="stat-value" id="cdri">--</span></div>
+                <div class="stat-row"><span class="stat-label" title="Uses gauge-stage severity; a zero score does not rule out flooding elsewhere.">EPS</span><span class="stat-value" id="eps">--</span></div>
+                <div class="stat-row"><span class="stat-label" title="70% mean evidence-source quality + 30% completeness of four components: observed flood extent, affected population, affected facilities, and road impact. A modeled extent and missing road impact lower completeness; bridge exposure is not included.">Data confidence</span><span class="stat-value" id="data-confidence">--</span></div>
             </div>
         </div>
 
@@ -514,9 +523,10 @@
             </div>
             <div id="pareto-scatter" style="margin-top:8px;"><div style="color:#777;">Run an assessment to populate.</div></div>
             <div id="pareto-suppressed" style="display:none;background:#F1F8E9;border:1px solid #A5D6A7;padding:8px 10px;border-radius:6px;font-size:12px;">
-                <b>No active hazard</b> (gauge at/below action stage, CDRI = 0) — the efficiency–equity panel is pre-positioning analysis only; no dispatch recommendation is made.
+                <b>No operational flood trigger</b> — no verified threshold exceedance, accepted flood extent, or point alert. No dispatch recommendation is shown.
             </div>
             <div id="plan-detail" class="plan-detail" style="display:none;"></div>
+            <div id="plan-options" class="plan-detail" style="display:none;margin-top:8px;"></div>
         </div>
         </div><!-- /panel-section section 2 -->
 
@@ -529,7 +539,7 @@
         <div class="section-body">
             <!-- Status & Recommendation -->
             <div class="stat-row" style="border-bottom: none; margin-top: 4px;">
-                <span class="stat-label">Status</span>
+                <span class="stat-label">Gauge status</span>
                 <span class="stat-value" id="status-badge"><span class="badge badge-unknown">--</span></span>
             </div>
 
@@ -567,7 +577,7 @@
     <div id="query-form">
         <input type="text" id="query-input" placeholder="e.g., flood Manhattan Kansas 06887000 — or — assess flooding near Friendswood station 08077600" value="Assess flood around Friendswood station 08077600">
         <input type="text" id="event-date" placeholder="event date YYYY-MM-DD (optional)" title="Optional event date — empty = real-time assessment; a past date = historical replay with strict time alignment" style="width:170px;padding:8px;border-radius:6px;border:1px solid #cfd8e3;background:#fff;color:#1a2b3c;">
-        <button id="submit-demo" title="Offline demo: full pipeline against fixtures — no network, guaranteed equity ledger and lambda slider on any date" style="background:#2e7d32;">Demo</button>
+        <button id="submit-demo" title="Fixed offline Friendswood flood fixture; it does not assess the place typed in the query box" style="background:#2e7d32;">Friendswood Demo</button>
         <button id="submit-query">Execute</button>
     </div>
 
@@ -614,6 +624,9 @@
         const submitBtn = $('submit-query');
         const queryInput = $('query-input');
         const infoPanel = $('info-panel');
+        const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+        })[ch]);
 
         // ------------------------------------------------------------
         //  Collapsible Toggle
@@ -640,8 +653,19 @@
 
             // Observations
             $('station-id').textContent = s.station_name ? `${s.station_name} (${s.station_id || 'USGS'})` : (s.station_id || '--');
-            $('precipitation').textContent = s.precipitation || '--';
-            $('forecast').textContent = s.forecast || '--';
+            const historicalReplay = s.assessment_mode === 'historical';
+            const setOptionalObservation = (id, value) => {
+                const el = $(id);
+                const row = el.closest('.stat-row');
+                if (historicalReplay && (value === null || value === undefined || value === '')) {
+                    row.style.display = 'none';
+                    return;
+                }
+                row.style.display = 'flex';
+                el.textContent = value || '--';
+            };
+            setOptionalObservation('precipitation', s.precipitation);
+            setOptionalObservation('forecast', s.forecast);
 
             // Forecast periods: grouped by date, day/night periods per
             // day, each with a data line and a status line, right-aligned.
@@ -697,6 +721,8 @@
                 fpGroup.style.display = 'none';
             }
 
+            $('water-level-label').textContent = s.observation_semantics === 'window_peak'
+                ? 'Event Peak Water Level' : 'Water Level';
             $('water-level').textContent = s.water_level !== undefined && s.water_level !== null ? s.water_level + ' ft' : '--';
             // Treat null and undefined as missing (stations without full
             // NWPS categories have null moderate/major; never show "null ft")
@@ -705,37 +731,71 @@
             $('minor-stage').textContent = fmtFt(s.minor_stage);
             $('moderate-stage').textContent = fmtFt(s.moderate_stage);
             $('major-stage').textContent = fmtFt(s.major_stage);
-            $('flood-extent').textContent = s.flood_extent || (
+            const extentLabel = s.extent_provenance === 'modeled_stage_buffer'
+                ? 'modeled stage buffer'
+                : (s.extent_provenance === 'satellite_sar' ? 'satellite SAR' : null);
+            $('flood-extent').textContent = s.flood_extent
+                ? `${s.flood_extent}${extentLabel ? ` · ${extentLabel}` : ''}`
+                : (
                 s.flood_extent_status === 'not_detected'
-                    ? 'Not detected (no inundation map)'
+                    ? 'No usable inundation extent'
                     : '--'
-            );
-            $('flood-extent').title = s.flood_extent_status === 'not_detected'
-                ? 'No satellite flood extent detected/available; inundation-dependent analysis (map, areal exposure) was skipped.'
-                : '';
-            $('alerts').textContent = s.alerts || '--';
+                );
+            const extentDetails = [];
+            if (s.extent_timestamp) extentDetails.push(`timestamp: ${s.extent_timestamp}`);
+            if (s.extent_confidence !== undefined && s.extent_confidence !== null) {
+                extentDetails.push(`confidence: ${s.extent_confidence}`);
+            }
+            $('flood-extent').title = extentDetails.length
+                ? extentDetails.join(' · ')
+                : (s.flood_extent_status === 'not_detected'
+                    ? 'No usable satellite or modeled inundation extent was produced.'
+                    : '');
+            setOptionalObservation('alerts', s.alerts);
 
             // Derived
-            $('population-total').textContent = s.population_total ? s.population_total.toLocaleString() : '--';
-            // Affected population: prefers the tract-centroid ∩ flood
-            // area estimate; falls back to the containing tract population
-            const affectedPop = s.population_affected ?? s.population_exposure;
-            $('population-affected').textContent = affectedPop ? affectedPop.toLocaleString() : '--';
+            const sviScope = s.svi_scope === 'city_boundary'
+                ? 'boundary tracts'
+                : (s.svi_radius_km != null
+                    ? `tracts in ${s.svi_radius_km} km search`
+                    : 'SVI tracts');
+            $('population-scope-label').textContent = `Population (${sviScope})`;
+            $('population-scope-label').title = 'Sum of whole-tract Census population for the selected SVI tracts; not the population of the gauge tract.';
+            $('svi-scope-label').title = `Population-weighted SVI over ${sviScope}.`;
+            $('population-total').textContent = s.population_total !== undefined && s.population_total !== null
+                ? s.population_total.toLocaleString() : '--';
+            // Only the census ∩ operational flood-extent estimate is an
+            // affected population. A containing tract's population is context,
+            // not a valid fallback for this field.
+            const affectedPop = s.population_affected;
+            $('population-affected').textContent = affectedPop !== undefined && affectedPop !== null
+                ? affectedPop.toLocaleString() : '--';
             $('buildings').textContent = s.infrastructure_counts?.affected_buildings ?? '--';
             $('facilities').textContent = s.infrastructure_counts?.affected_facilities ?? '--';
-            $('roads').textContent = s.infrastructure_counts?.affected_roads ?? '--';
-            $('bridges').textContent = s.infrastructure_counts?.affected_bridges ?? '--';
+            $('roads').textContent = s.infrastructure_counts?.affected_roads ?? 'not calculated';
+            $('bridges').textContent = s.infrastructure_counts?.affected_bridges ?? 'not calculated';
             $('svi-value').textContent = s.svi !== undefined && s.svi !== null ? s.svi.toFixed(4) : '--';
             // CDRI: percent + relative-risk band
             const di = s.decision_indices || {};
             if (di.cdri_percent !== undefined && di.cdri_percent !== null) {
                 const riskLabel = di.cdri_risk_label || '';
+                const screening = di.cdri_label_policy?.validation_status === 'not_independently_validated';
                 $('cdri').textContent = `${di.cdri_percent}% · ${riskLabel}`;
+                $('cdri').title = screening
+                    ? 'The numeric CDRI is reported continuously; its categorical band is a screening policy and has not been independently validated.'
+                    : '';
             } else {
                 $('cdri').textContent = di.cdri !== undefined && di.cdri !== null ? (di.cdri * 100).toFixed(2) + '%' : '--';
             }
             $('eps').textContent = s.decision_indices?.eps?.toFixed?.(3) ?? '--';
             $('data-confidence').textContent = s.decision_indices?.data_confidence?.toFixed?.(3) ?? '--';
+            const confidenceDetail = s.decision_indices?.data_confidence_detail;
+            $('data-confidence').title = confidenceDetail
+                ? `source quality ${confidenceDetail.evidence_quality_mean} · completeness ${confidenceDetail.completeness} · `
+                    + Object.entries(confidenceDetail.completeness_components || {})
+                        .map(([name, present]) => `${name}: ${present ? 'present' : 'missing'}`)
+                        .join(' · ')
+                : '';
             
             // Load the GIS map (flood extent + routing render): set the
             // iframe src dynamically, show the modal, keep a reopen button
@@ -758,16 +818,17 @@
             const badgeSpan = document.querySelector('#status-badge .badge');
             const wl = s.water_level;
             const action = s.action_stage;
+            const hydroCategory = s.hydrologic_category;
             let statusText = '--', badgeClass = 'badge-unknown';
-            if (wl !== undefined && action !== undefined && wl !== null && action !== null) {
-                if (wl < action) {
+            if (hydroCategory) {
+                if (hydroCategory === 'below_action') {
                     statusText = 'Normal';
                     badgeClass = 'badge-normal';
-                } else if (wl < (s.minor_stage || Infinity)) {
-                    statusText = 'Watch';
+                } else if (hydroCategory === 'action') {
+                    statusText = 'Action stage';
                     badgeClass = 'badge-warning';
                 } else {
-                    statusText = 'Danger';
+                    statusText = `${hydroCategory[0].toUpperCase()}${hydroCategory.slice(1)} flood`;
                     badgeClass = 'badge-danger';
                 }
             }
@@ -776,31 +837,10 @@
 
             // Recommendation
             const nextAction = $('next-action-text');
-            if (data.report) {
-                const lines = data.report.split('\n');
-                let found = false;
-                for (let i = 0; i < lines.length; i++) {
-                    if (lines[i].toLowerCase().includes('recommended')) {
-                        const nextLine = lines[i+1]?.trim();
-                        if (nextLine && !nextLine.startsWith('===')) {
-                            nextAction.textContent = nextLine;
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found) {
-                    if (wl !== undefined && action !== undefined && wl < action) {
-                        nextAction.textContent = 'Water level below action stage. No urgent action needed.';
-                    } else if (wl !== undefined && action !== undefined && wl >= action) {
-                        nextAction.textContent = 'Water level exceeds action stage. Consider monitoring.';
-                    } else {
-                        nextAction.textContent = 'Check latest observation and thresholds.';
-                    }
-                }
-            } else {
-                nextAction.textContent = 'No report available.';
-            }
+            const backendActions = s.next_actions || [];
+            nextAction.textContent = backendActions.length
+                ? backendActions[0]
+                : 'No structured next action available.';
         }
 
         // ------------------------------------------------------------
@@ -856,7 +896,8 @@
             const layers = data?.gis_layers || {};
             const noActiveHazard = data.active_hazard === false;
             const unverified = (data.sar_stage_contradiction === true
-                                || data.sar_implausible === true);
+                                || data.sar_implausible === true
+                                || data.sar_uncorroborated === true);
             const floodLayerName = unverified
                 ? '🟦 Satellite-detected surface water (unverified — contradicts in-bank gauge)'
                 : '🟥 Flood extent';
@@ -868,8 +909,14 @@
             if (noActiveHazard && noFloodLayers) {
                 const calm = document.createElement('div');
                 calm.className = 'gis-note';
-                calm.style.cssText = 'background:#E8F5E9;border:1px solid #A5D6A7;padding:8px 10px;margin:6px 0;border-radius:6px;font-size:12px;';
-                calm.innerHTML = '<b>✓ No flooding detected</b> — gauge within banks; no fresh satellite water footprint in the look-back window (or a contradictory footprint was rejected as implausible). CDRI/EPS = 0 by the water-primary rule.';
+                if (data.sar_uncorroborated === true) {
+                    calm.style.cssText = 'background:#FFF3CD;border:1px solid #FFA000;padding:8px 10px;margin:6px 0;border-radius:6px;font-size:12px;';
+                    calm.innerHTML = '<b>⚠ Unverified satellite candidate excluded</b> — Sentinel-1 found '
+                        + `${s.unverified_surface_water_area_km2 ?? '--'} km² of backscatter change, but the gauge is below its official action stage and no active NWS flood warning corroborates it. It is not shown or counted as a flood area.`;
+                } else {
+                    calm.style.cssText = 'background:#E8F5E9;border:1px solid #A5D6A7;padding:8px 10px;margin:6px 0;border-radius:6px;font-size:12px;';
+                    calm.innerHTML = '<b>✓ No operational flood extent</b> — the gauge is within banks and no corroborated flood footprint is available.';
+                }
                 const iframe2 = document.getElementById('gis-map-iframe');
                 if (iframe2 && iframe2.parentNode) {
                     iframe2.parentNode.insertBefore(calm, iframe2.nextSibling);
@@ -888,7 +935,7 @@
             ];
             // Per-layer toggles: routes/POIs are tiny at city zoom and must be highlightable individually
             const overlayGroups = {};
-            if (unverified) {
+            if (unverified && layers.flood_extent_url) {
                 const banner = document.createElement('div');
                 banner.className = 'gis-note';
                 banner.style.cssText = 'background:#FFF3CD;border:1px solid #FFA000;padding:8px 10px;margin:6px 0;border-radius:6px;font-size:12px;';
@@ -915,7 +962,11 @@
                             : undefined,
                         onEachFeature: (feature, lyr) => {
                             const name = feature.properties?.name || feature.properties?.amenity || '';
-                            if (name) lyr.bindPopup(`<b>${name}</b>`);
+                            const address = feature.properties?.address || '';
+                            if (name) lyr.bindPopup(
+                                `<b>${escapeHtml(name)}</b>`
+                                + (address && address !== name ? `<br>${escapeHtml(address)}` : '')
+                            );
                         }
                     }).addTo(g);
                     overlayGroups[spec.name] = g;
@@ -984,8 +1035,12 @@
                 return;
             }
 
-            submitBtn.disabled = true;
-            submitBtn.textContent = demo ? '⏳ Demo...' : '⏳ Assessing...';
+            const activeButton = demo
+                ? document.getElementById('submit-demo')
+                : submitBtn;
+            const originalButtonText = activeButton.textContent;
+            activeButton.disabled = true;
+            activeButton.textContent = demo ? '⏳ Friendswood Demo...' : '⏳ Assessing...';
             loadingOverlay.classList.add('active');
             document.getElementById('map').classList.add('loading');
 
@@ -1019,16 +1074,16 @@
                     );
                     return;
                 }
+                lastRunId = data.run_id || null;
                 updateUI(data);
                 updateMap(data);
                 updatePanel(data);
-                lastRunId = data.run_id || null;
                 infoPanel.style.display = 'block';
             } catch (e) {
                 showError('Request failed: ' + e.message);
             } finally {
-                submitBtn.disabled = false;
-                submitBtn.textContent = 'Execute';
+                activeButton.disabled = false;
+                activeButton.textContent = originalButtonText;
                 loadingOverlay.classList.remove('active');
                 document.getElementById('map').classList.remove('loading');
             }
@@ -1038,6 +1093,12 @@
         //  Right panel: raw data / lambda+Pareto / status+decision
         // ------------------------------------------------------------
         let lastFrontierCurve = [];
+        let lastPlanScenarios = [];
+        let lastRecommendedPlanId = null;
+        let lastBaseRecommendedPlanId = null;
+        let lastInspectedPlanId = null;
+        let lastFrontierLambda = null;
+        let lambdaRequestSeq = 0;
         // run_id of the latest assessment: attached to lambda-slider and
         // HITL submissions so concurrent runs never cross data.
         let lastRunId = null;
@@ -1077,11 +1138,25 @@
             $('fused-list').innerHTML = rawHtml;
 
             // ── Section 2 · lambda slider + Pareto scatter + plan detail ──
-            // No-hazard days (in-bank gauge, CDRI=0): no dispatch
-            // recommendation — the panel degrades to a pre-positioning note.
+            // No-hazard runs: no dispatch recommendation. A gauge below
+            // action stage does not suppress a plan when an accepted flood
+            // extent or a point alert independently confirms local flooding.
             const ropt = s.resource_optimization || {};
             const ledger = ropt.equity_ledger || {};
+            lambdaRequestSeq += 1;
             lastFrontierCurve = ledger.frontier_equity_curve || [];
+            lastPlanScenarios = ropt.plan_scenarios || [];
+            lastRecommendedPlanId = ropt.recommended_plan_id || null;
+            lastBaseRecommendedPlanId = lastRecommendedPlanId;
+            lastInspectedPlanId = null;
+            const baseLambda = Number(ledger.vulnerability_weight);
+            lastFrontierLambda = Number.isFinite(baseLambda) ? baseLambda : null;
+            if (lastFrontierLambda !== null) {
+                $('lambda-slider').max = String(Math.max(3, lastFrontierLambda));
+                $('lambda-slider').value = String(lastFrontierLambda);
+                $('lambda-val').textContent = lastFrontierLambda.toFixed(1);
+            }
+            $('lambda-result').textContent = '';
             if (data.status === 'error') {
                 // Failed run: not "no hazard"; never show the green no-hazard box
                 $('pareto-suppressed').style.display = 'none';
@@ -1089,6 +1164,7 @@
                     '<div style="color:#777;">Assessment failed — no analysis output.</div>';
                 $('lambda-box').style.display = 'none';
                 $('plan-detail').style.display = 'none';
+                $('plan-options').style.display = 'none';
                 $('lambda-result').textContent = '';
             } else if (data.active_hazard === false) {
                 // No-hazard day: no dispatch recommendation — pre-positioning note only
@@ -1098,19 +1174,24 @@
                     + 'Use the Demo run for a pre-positioning analysis of the frontier.</div>';
                 $('lambda-box').style.display = 'none';
                 $('plan-detail').style.display = 'none';
+                $('plan-options').style.display = 'none';
                 $('lambda-result').textContent = '';
             } else {
                 $('pareto-suppressed') && ($('pareto-suppressed').style.display = 'none');
-                renderParetoScatter(lastFrontierCurve, ropt.recommended_plan_id);
+                renderParetoScatter(lastFrontierCurve, lastRecommendedPlanId);
                 if (lastFrontierCurve.length) {
                     $('lambda-box').style.display = 'block';
                     const rec = lastFrontierCurve.find(
                         p => p.plan_id === ropt.recommended_plan_id
                     ) || lastFrontierCurve[0];
-                    if (rec) renderPlanDetail(rec);
+                    if (rec) {
+                        renderPlanDetail(rec);
+                    }
+                    renderPlanOptions(lastPlanScenarios);
                 } else {
                     $('lambda-box').style.display = 'none';
                     $('plan-detail').style.display = 'none';
+                    $('plan-options').style.display = 'none';
                     $('lambda-result').textContent = '';
                 }
             }
@@ -1120,10 +1201,19 @@
             const unc = di.uncertainty || {};
             let decHtml = '';
             if (unc.top_components && unc.top_components.length) {
-                decHtml += `<div class="uncertainty-box">±10% component envelope: CDRI ∈ [${(unc.interval_percent || [0,0])[0]}%, ${(unc.interval_percent || [0,0])[1]}%]<br>Most sensitive: <strong>${unc.top_components.join(', ')}</strong></div>`;
+                decHtml += `<div class="uncertainty-box">What-if test (normalized components ±${unc.delta ?? 0.1}; missing inputs 0–1): CDRI scenarios ${(unc.interval_percent || [0,0])[0]}%–${(unc.interval_percent || [0,0])[1]}%. This is not a confidence interval.<br>Most sensitive: <strong>${unc.top_components.join(', ')}</strong></div>`;
             }
             if (di.data_gaps && di.data_gaps.length) {
                 decHtml += `<div style="color:#a15c00;">⚠ data gaps: ${di.data_gaps.join(', ')}</div>`;
+            }
+            if (ropt.planning_gaps && ropt.planning_gaps.length) {
+                decHtml += `<div style="color:#a15c00;">⚠ planning gaps: ${ropt.planning_gaps.join(', ')}</div>`;
+            }
+            if (s.infrastructure_counts?.affected_roads == null) {
+                decHtml += '<div style="color:#a15c00;">⚠ Road impact not calculated; counted as a data gap and in data-confidence completeness.</div>';
+            }
+            if (s.infrastructure_counts?.affected_bridges == null) {
+                decHtml += '<div style="color:#a15c00;">⚠ Bridge exposure not calculated; it is not in the paper’s confidence formula.</div>';
             }
             $('decision-extras').innerHTML = decHtml;
             $('report-text').textContent = data.report || 'No report generated.';
@@ -1135,12 +1225,16 @@
                 p => p.cost != null && p.vulnerability_weighted_unmet_need != null
             );
             if (!valid.length) {
-                host.innerHTML = '<div style="color:#777;">No Pareto frontier equity data (needs flood extent + SVI).</div>';
+                host.innerHTML = '<div style="color:#777;">No allocation comparison was generated for this run.</div>';
                 return;
             }
             const W = 320, H = 200, PAD = 34;
             const xs = valid.map(p => p.cost), ys = valid.map(p => p.vulnerability_weighted_unmet_need);
-            const xMin = Math.min(...xs), xMax = Math.max(...xs), yMin = 0, yMax = Math.max(...ys) * 1.1 || 1;
+            const xMin = Math.min(...xs), xMax = Math.max(...xs);
+            const rawYMin = Math.min(...ys), rawYMax = Math.max(...ys);
+            const ySpread = rawYMax - rawYMin;
+            const yPad = Math.max(ySpread * 0.15, Math.abs(rawYMax) * 0.005, 1);
+            const yMin = Math.max(0, rawYMin - yPad), yMax = rawYMax + yPad;
             const sx = c => PAD + (W - 2 * PAD) * ((c - xMin) / (xMax - xMin || 1));
             const sy = v => H - PAD - (H - 2 * PAD) * ((v - yMin) / (yMax - yMin || 1));
             // Color: greener = higher SVI coverage
@@ -1164,7 +1258,13 @@
                     <title>${p.plan_id}\ncost ${p.cost} · VWUN ${p.vulnerability_weighted_unmet_need}\nSVI coverage ${p.vulnerability_coverage ?? '--'}</title>
                 </circle>`;
             });
-            svg += '</svg><div style="font-size:11px;color:#666;">click a point to inspect the plan · red ring = recommended · greener = higher SVI coverage</div>';
+            svg += '</svg><div style="font-size:11px;color:#666;">click a point to inspect the plan · red ring = original recommended plan · greener = higher SVI coverage · VWUN axis zoomed to the current plan range</div>';
+            const frontierList = valid.map(p => {
+                const normalized = p.normalized_vulnerability_weighted_unmet_need;
+                return `${p.plan_id}: ${Number(p.vulnerability_weighted_unmet_need).toLocaleString()}`
+                    + (normalized == null ? '' : ` (${Number(normalized).toFixed(3)})`);
+            }).join(' · ');
+            svg += `<div style="font-size:11px;margin-top:5px;">Frontier VWUN${lastFrontierLambda !== null ? ` (λ=${lastFrontierLambda.toFixed(1)})` : ''} — ${frontierList}</div>`;
             host.innerHTML = svg;
             host.querySelectorAll('.pareto-point').forEach(el => {
                 el.addEventListener('click', () => {
@@ -1177,19 +1277,73 @@
         function renderPlanDetail(p) {
             const box = $('plan-detail');
             box.style.display = 'block';
+            lastInspectedPlanId = p.plan_id;
             const covered = (p.covered_tract_ids || []);
             const highSvi = (p.covered_high_svi_tract_ids || []);
+            const timeRange = p.transfer_time_estimate_range_minutes;
+            const timeText = timeRange
+                ? `${timeRange.min}–${timeRange.max} min (planning range)`
+                : '--';
+            const normalizedVwun = p.normalized_vulnerability_weighted_unmet_need;
+            const normalizedText = normalizedVwun == null
+                ? ''
+                : ` <span class="metric-secondary" title="Normalized against the same vulnerability-weighted demand at zero coverage; 0 = all served, 1 = none served.">(${Number(normalizedVwun).toFixed(3)} normalized)</span>`;
+            const equityValue = p.equity_gap == null ? 'N/A' : p.equity_gap;
             box.innerHTML = `
-                <strong>${p.plan_id}</strong>
-                <div>💸 Economic cost (dispatch burden): <strong>${p.cost ?? '--'}</strong></div>
-                <div>🤝 Vulnerability-weighted unmet need (VWUN): <strong>${p.vulnerability_weighted_unmet_need ?? '--'}</strong></div>
-                <div>⚖️ Equity gap (high−low SVI coverage): <strong>${p.equity_gap ?? '--'}</strong></div>
-                <div>🛡️ SVI-weighted coverage: <strong>${p.vulnerability_coverage ?? '--'}</strong></div>
-                <div style="margin-top:6px;"><strong>Protected communities (${covered.length}):</strong>
-                    <div class="tract-list">${covered.length ? covered.join(', ') : 'none'}</div>
+                <div class="plan-detail-title">${p.plan_id}</div>
+                <div class="plan-metric"><span class="plan-metric-label">💸 Economic cost</span><span class="plan-metric-value">${p.cost ?? '--'}</span></div>
+                <div class="plan-metric"><span class="plan-metric-label">🤝 VWUN${lastFrontierLambda !== null ? ` (λ=${lastFrontierLambda.toFixed(1)})` : ''}</span><span class="plan-metric-value">${p.vulnerability_weighted_unmet_need ?? '--'}${normalizedText}</span></div>
+                <div class="plan-metric"><span class="plan-metric-label">⚖️ Equity gap</span><span class="plan-metric-value">${equityValue}</span></div>
+                ${p.equity_gap == null && p.equity_gap_note ? `<div class="plan-subsection-value">${p.equity_gap_note}</div>` : ''}
+                <div class="plan-metric"><span class="plan-metric-label">🛡️ SVI-weighted coverage</span><span class="plan-metric-value">${p.vulnerability_coverage ?? '--'}</span></div>
+                <div class="plan-metric"><span class="plan-metric-label">👥 Capacity assignment</span><span class="plan-metric-value">${p.served_people ?? '--'} served / ${p.unmet_people ?? '--'} unmet</span></div>
+                <div class="plan-metric"><span class="plan-metric-label">📏 p95 assignment distance</span><span class="plan-metric-value">${p.travel_distance_p95_km ?? '--'} km</span></div>
+                <div class="plan-metric"><span class="plan-metric-label">⏱️ Transfer-time estimate</span><span class="plan-metric-value">${timeText}</span></div>
+                <div class="plan-subsection">
+                    <div class="plan-subsection-title">Fully served communities · ${covered.length}</div>
+                    <div class="plan-subsection-value tract-list">${covered.length ? covered.join(', ') : 'None'}</div>
                 </div>
-                ${highSvi.length ? `<div style="margin-top:4px;color:#2e7d32;"><strong>High-SVI tracts prioritized:</strong> <span class="tract-list">${highSvi.join(', ')}</span></div>` : ''}
+                ${highSvi.length ? `<div class="plan-subsection"><div class="plan-subsection-title">High-SVI tracts prioritized</div><div class="plan-subsection-value tract-list">${highSvi.join(', ')}</div></div>` : ''}
             `;
+        }
+
+        function renderPlanOptions(scenarios) {
+            const box = $('plan-options');
+            if (!scenarios || !scenarios.length) {
+                box.style.display = 'none';
+                return;
+            }
+            box.style.display = 'block';
+            box.innerHTML = '<strong>Choose a planning priority</strong>' + scenarios.map(s => `
+                <div style="border-top:1px solid #ddd;margin-top:7px;padding-top:7px;">
+                    <div><strong>${s.label}</strong> → ${s.plan_id}</div>
+                    <div style="font-size:11px;color:#666;">${s.description || ''}</div>
+                    <button class="select-plan-btn" data-scenario="${s.scenario_id}" data-plan="${s.plan_id}"
+                        style="margin-top:5px;padding:4px 8px;cursor:pointer;">Select this plan</button>
+                </div>`).join('') + '<div id="plan-selection-result" style="margin-top:6px;font-size:11px;"></div>';
+            box.querySelectorAll('.select-plan-btn').forEach(button => {
+                button.addEventListener('click', async () => {
+                    const result = $('plan-selection-result');
+                    try {
+                        const response = await fetch('/api/plan-selection', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                run_id: lastRunId,
+                                scenario_id: button.dataset.scenario,
+                                plan_id: button.dataset.plan,
+                                selected_by: 'dashboard_operator'
+                            })
+                        });
+                        const payload = await response.json();
+                        result.textContent = response.ok
+                            ? `Recorded selection: ${payload.plan_id}`
+                            : (payload.detail || 'Selection could not be recorded.');
+                    } catch (error) {
+                        result.textContent = 'Selection endpoint unreachable.';
+                    }
+                });
+            });
         }
 
         // Live lambda recalc: slider drag recomputes VWUN / equity gap
@@ -1197,6 +1351,8 @@
         let lambdaTimer = null;
         $('lambda-slider').addEventListener('input', (e) => {
             const lam = parseFloat(e.target.value);
+            const requestSeq = ++lambdaRequestSeq;
+            const runId = lastRunId;
             $('lambda-val').textContent = lam.toFixed(1);
             $('lambda-result').innerHTML = '<span style="color:#777;">recalculating…</span>';
             clearTimeout(lambdaTimer);
@@ -1205,31 +1361,55 @@
                     const resp = await fetch('/api/equity/sensitivity', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ vulnerability_weight: lam, run_id: lastRunId })
+                        body: JSON.stringify({ vulnerability_weight: lam, run_id: runId })
                     });
                     const d = await resp.json();
+                    if (requestSeq !== lambdaRequestSeq || runId !== lastRunId) return;
                     if (!resp.ok) {
                         $('lambda-result').textContent = d.detail || 'unavailable';
                         return;
                     }
                     let html =
-                        `VWUN(λ=${lam.toFixed(1)}) = <strong>${d.vulnerability_weighted_unmet_need.toLocaleString()}</strong> · ` +
-                        `equity gap = <strong>${d.equity_gap}</strong> · ` +
-                        `covered tracts ${d.covered_tract_count}/${d.demand_tract_count}`;
+                        `Base plan ${lastBaseRecommendedPlanId || '--'} VWUN(λ=${lam.toFixed(1)}) = <strong>${d.vulnerability_weighted_unmet_need.toLocaleString()}</strong> ` +
+                        `<span class="metric-secondary">(${Number(d.normalized_vulnerability_weighted_unmet_need).toFixed(3)} normalized)</span> · ` +
+                        `equity gap = <strong>${d.equity_gap == null ? 'N/A' : d.equity_gap}</strong> · ` +
+                        `fully served tracts ${d.covered_tract_count}/${d.demand_tract_count}`;
                     // Frontier preview: who wins the full frontier at this
                     // lambda — would the recommendation flip?
                     const fp = d.frontier_preview;
-                    if (fp && fp.would_recommend) {
-                        const plans = Object.entries(fp.vwun_by_plan || {})
-                            .map(([id, v]) => `${id}: ${v.toLocaleString()}`)
-                            .join(' · ');
-                        const flip = fp.recommendation_changed
-                            ? `<span style="color:#c0392b;">⚠ recommendation would flip → ${fp.would_recommend}</span>`
-                            : `<span style="color:#1e8e3e;">recommendation stays: ${fp.would_recommend}</span>`;
-                        html += `<br>frontier VWUN — ${plans}<br>${flip}`;
+                    if (fp && fp.vwun_by_plan) {
+                        const updatedVwun = fp.vwun_by_plan || {};
+                        const updatedNormalizedVwun = fp.normalized_vwun_by_plan || {};
+                        if (!lastFrontierCurve.every(plan => Object.prototype.hasOwnProperty.call(updatedVwun, plan.plan_id))) {
+                            $('lambda-result').textContent = 'Frontier preview incomplete; plan values remain at the previous λ.';
+                            return;
+                        }
+                        lastFrontierCurve = lastFrontierCurve.map(plan => ({
+                            ...plan,
+                            vulnerability_weighted_unmet_need: updatedVwun[plan.plan_id],
+                            normalized_vulnerability_weighted_unmet_need: updatedNormalizedVwun[plan.plan_id]
+                        }));
+                        lastFrontierLambda = lam;
+                        renderParetoScatter(lastFrontierCurve, lastRecommendedPlanId);
+                        const inspected = lastFrontierCurve.find(
+                            plan => plan.plan_id === lastInspectedPlanId
+                        ) || lastFrontierCurve.find(
+                            plan => plan.plan_id === lastRecommendedPlanId
+                        );
+                        if (inspected) renderPlanDetail(inspected);
+                        const flip = !fp.would_recommend
+                            ? 'recommendation preview unavailable'
+                            : (fp.recommendation_changed
+                                ? `<span style="color:#c0392b;">⚠ recommendation would flip → ${fp.would_recommend}</span>`
+                                : `<span style="color:#1e8e3e;">recommendation stays: ${fp.would_recommend}</span>`);
+                        html += `<br>${flip}`;
+                        html += '<br>Existing assignments are held fixed in this λ preview.';
+                    } else {
+                        html += '<br>Plan comparison was not recalculated; the card retains its previous λ.';
                     }
                     $('lambda-result').innerHTML = html;
                 } catch (err) {
+                    if (requestSeq !== lambdaRequestSeq || runId !== lastRunId) return;
                     $('lambda-result').textContent = 'sensitivity endpoint unreachable';
                 }
             }, 200);

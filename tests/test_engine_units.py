@@ -81,7 +81,7 @@ def _risk_inputs(**overrides):
             "profile": {"population_weighted_svi": 0.5, "total_population": 1000},
             "tracts": [],
         },
-        gis_stats={"affected_population": 500, "affected_facilities": 30, "travel_time_min": None},
+        gis_stats={"affected_population": 500, "affected_facilities": 30, "facility_inventory_count": 60, "affected_roads": 0, "travel_time_min": None},
         fused_measurements={"facility_count": {"value": 60}, "road_count": {"value": 0.0}},
         fusion_sources=[{"tool": "get_road_status", "arguments": {"radius_km": 10}}],
         observations=[{"quality_score": 0.8}, {"quality_score": 0.6}],
@@ -108,7 +108,77 @@ def test_risk_engine_indices_match_formula():
     assert "response_capacity" in result["components"]
     # EPS: water_sat 1/3 x (1+0.5)/2 x (1+0.5)/2 = 0.1875
     assert result["eps"] == pytest.approx(0.1875, abs=1e-4)
-    assert result["data_confidence"] == pytest.approx(0.715, abs=1e-6)
+    # Both observations omit a source and therefore represent one unknown
+    # source (mean quality 0.7), not two independent votes.  All five inputs
+    # used by CDRI/EPS are present: 0.7*0.7 + 0.3*1.0 = 0.79.
+    assert result["data_confidence"] == pytest.approx(0.79, abs=1e-6)
+
+
+def test_facility_exposure_uses_matching_inventory_not_fused_radius_count():
+    result = RiskEngine().compute_decision_indices(
+        **_risk_inputs(
+            gis_stats={
+                "affected_population": 0,
+                "affected_facilities": 6,
+                "facility_inventory_count": 12,
+            },
+            fused_measurements={
+                "facility_count": {"value": 544},
+                "road_count": {"value": 0},
+            },
+        )
+    )
+    assert result["components"]["exposure"] == pytest.approx(0.5)
+    assert "affected_facilities" not in result["data_gaps"]
+
+
+def test_modeled_extent_and_missing_route_lower_confidence_and_degrade_label():
+    observed = RiskEngine().compute_decision_indices(**_risk_inputs())
+    modeled = RiskEngine().compute_decision_indices(**_risk_inputs(
+        gis_stats={
+            "affected_population": 500,
+            "affected_facilities": 30,
+            "facility_inventory_count": 60,
+            "extent_provenance": "modeled_stage_buffer",
+        },
+    ))
+    assert modeled["data_confidence"] == pytest.approx(
+        observed["data_confidence"] - 0.15, abs=1e-6
+    )
+    assert observed["data_confidence_detail"]["completeness"] == 1.0
+    assert modeled["data_confidence_detail"]["completeness"] == 0.5
+    assert modeled["data_confidence_detail"]["completeness_components"] == {
+        "observed_flood_extent": False,
+        "affected_population": True,
+        "affected_facilities": True,
+        "road_impact": False,
+    }
+    assert "observed_flood_extent" in modeled["data_gaps"]
+    assert "road_impact" in modeled["data_gaps"]
+    assert "(degraded:" in modeled["cdri_risk_label"]
+
+
+def test_containing_tract_population_is_not_affected_population():
+    result = RiskEngine().compute_decision_indices(
+        **_risk_inputs(
+            gis_stats={"affected_facilities": 30, "facility_inventory_count": 60},
+            fused_measurements={
+                "containing_tract_population": {"value": 900},
+                # Legacy payloads may still use this old variable name; it
+                # must not revive the invalid exposure fallback.
+                "population_exposure": {"value": 900},
+                "facility_count": {"value": 60},
+                "road_count": {"value": 0.0},
+            },
+        )
+    )
+
+    assert result["inputs"]["affected_population"] is None
+    assert result["inputs"]["affected_population_source"] == "unavailable"
+    assert "affected_population_or_total_population" in result["data_gaps"]
+    assert result["substitutions"]["population_severity"] == (
+        "missing→neutral_0.5"
+    )
 
 
 def test_risk_engine_major_referenced_water_severity():
@@ -240,6 +310,35 @@ def test_areal_weighted_population_no_overlap():
     assert affected == 0.0
     assert count == 0
     assert method == "areal_weighted"
+
+
+def test_population_geometry_failure_never_counts_whole_tract():
+    from shapely.geometry import Polygon
+
+    engine = GeometryEngine()
+    flood = Polygon(_ring(29.50, -95.10, d=0.01))
+    tracts = {
+        "status": "ok",
+        "tracts": [
+            {
+                "tract_id": "T1",
+                "population": 1000,
+                "svi": 0.5,
+                "geometry": None,
+            }
+        ],
+    }
+
+    records = engine.tract_exposure(flood, tracts)
+    assert records[0]["exposed_population"] is None
+    assert records[0]["method"] == "unavailable_area_ratio"
+    affected, count, method = engine.estimate_affected_population(
+        flood, tracts
+    )
+    assert affected is None
+    assert count == 0
+    assert method == "unavailable_area_ratio"
+    assert engine.estimate_uniform_density_population(1000, 10, 100) == 100
 
 
 # ------------------------------------------------------------------
@@ -494,9 +593,8 @@ def test_risk_engine_missing_affected_facilities_neutral_not_count_fabrication()
         "affected_facilities missing" in str(v)
         for v in result["substitutions"].values()
     )
-    # Missing dimension -> exposure unconstrained: the interval's
-    # upper bound hits the exposure=1 ceiling (h x 1 x v with +/-10%
-    # jitter ~= 20.8%), far above the narrow band of the
-    # known-facilities path
-    assert result["uncertainty"]["interval_percent"] == [6.53, 20.8]
+    # The joint stress scenarios combine exposure's unknown [0,1]
+    # range with the measured components' ±0.1 shifts. Previously
+    # evaluating those changes separately understated the upper case.
+    assert result["uncertainty"]["interval_percent"] == [4.67, 26.0]
     print("PASS missing_affected_facilities_neutral")

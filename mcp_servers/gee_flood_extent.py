@@ -393,6 +393,40 @@ def _extract_flood_extent_sync(request: Dict[str, Any]) -> Dict[str, Any]:
     test_collection = s1.filterDate(post_start, post_end)
     post_count = int(test_collection.size().getInfo())
 
+    # ============= Forward extension (preferred) ==================
+    # Sentinel-1's 6-12 day revisit means the requested observation
+    # window can legitimately contain zero scenes while a scene exists
+    # a few days AFTER it -- still within the downstream historical
+    # lag tolerance (default [-1, +6] days). Extending FORWARD (start
+    # anchored at the event, end growing toward now) captures
+    # event-aftermath imagery; the backward extension below only ever
+    # finds pre-event scenes and stays the last resort (a pre-event
+    # pair will be rejected by the caller's time-alignment gate, but
+    # returning it at least makes the gap auditable).
+    MAX_FORWARD_DAYS = int(
+        os.environ.get("GEE_FORWARD_EXTENSION_DAYS", "7")
+    )
+    if (
+        post_count == 0
+        and requested_post_start_dt < now_utc
+    ):
+        for forward_days in range(1, MAX_FORWARD_DAYS + 1):
+            new_post_end_dt = min(
+                requested_post_end_dt + timedelta(days=forward_days),
+                now_utc,
+            )
+            new_post_end = new_post_end_dt.strftime("%Y-%m-%d")
+            if new_post_end <= post_start:
+                continue
+            test_collection = s1.filterDate(post_start, new_post_end)
+            test_count = int(test_collection.size().getInfo())
+            if test_count > 0:
+                post_end_dt = new_post_end_dt
+                post_end = new_post_end
+                post_count = test_count
+                window_adjusted = True
+                break
+
     # If the initial window has no imagery, extend backward: the window
     # end stays anchored (today) while the start grows day by day into
     # the past. An observation_date given as a UTC date can be a day
@@ -425,7 +459,11 @@ def _extract_flood_extent_sync(request: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "status": "error",
             "error_code": "NO_OBSERVATION_IMAGERY",
-            "error": f"No Sentinel-1 scenes found in observation window after expanding {extend_days} days.",
+            "error": (
+                f"No Sentinel-1 scenes found after extending up to "
+                f"{MAX_FORWARD_DAYS} days forward and {extend_days} days "
+                "backward from the observation window."
+            ),
             "request": request,
             "window_adjusted": window_adjusted,
         }

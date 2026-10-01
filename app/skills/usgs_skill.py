@@ -546,8 +546,10 @@ class UsgsSkill:
     ) -> dict[str, Any]:
         """
         Station gauge observation. No time window = latest instantaneous
-        value (real-time mode); with start_dt/end_dt = the observation
-        closest to end_dt within the window (historical replay).
+        value (real-time mode); with start_dt/end_dt = the PEAK value in
+        the event window plus a window_summary hydrograph (historical
+        replay -- the event's severity is its peak, not its window-end
+        snapshot).
         """
         arguments: dict[str, Any] = {
             "station_id": station_id,
@@ -664,6 +666,16 @@ class UsgsSkill:
             "observation_time": observation[
                 "observation_time"
             ],
+            # "window_peak" (historical replay: event stage = window
+            # peak, full hydrograph in window_summary) or
+            # "latest_instantaneous" (realtime). Older MCP builds omit
+            # both; None means "unspecified snapshot semantics".
+            "observation_semantics": observation.get(
+                "observation_semantics"
+            ),
+            "window_summary": observation.get(
+                "window_summary"
+            ),
             "source": observation.get(
                 "source",
                 "unknown",

@@ -14,6 +14,7 @@ from .pareto_engine import (
     pareto_frontier,
     select_best_pareto_plan,
 )
+from .supply_demand_engine import SupplyDemandEngine
 
 
 class AllocationEngine:
@@ -25,15 +26,20 @@ class AllocationEngine:
         weights: dict[str, float],
         max_plan_combinations: int,
         vulnerability_coverage_radius_km: float = 10.0,
+        planning_speed_range_kmh: tuple[float, float] | None = None,
+        eligible_facility_types: tuple[str, ...] | list[str] | str | None = None,
     ):
         self.objectives = objectives
         self.weights = weights
         self.max_plan_combinations = max_plan_combinations
-        # Coverage radius (km) for the vulnerability_coverage objective:
-        # a tract's population counts as covered when its centroid lies
-        # within this radius of any allocated facility.
+        # Fallback coverage radius for runs that lack tract-level demand.
+        # Normal flood runs derive coverage from actual capacity assignment.
         self.vulnerability_coverage_radius_km = (
             vulnerability_coverage_radius_km
+        )
+        self.supply_demand = SupplyDemandEngine(
+            planning_speed_range_kmh=planning_speed_range_kmh,
+            eligible_facility_types=eligible_facility_types,
         )
 
     def generate_plans(
@@ -41,6 +47,8 @@ class AllocationEngine:
         resources: list[dict[str, Any]],
         fused_evidence: dict[str, Any],
         svi_tracts: list[dict[str, Any]] | None = None,
+        demand_records: list[dict[str, Any]] | None = None,
+        vulnerability_weight: float = 1.0,
     ) -> list[dict[str, Any]]:
 
         if not resources:
@@ -146,6 +154,61 @@ class AllocationEngine:
                 :self.max_plan_combinations
             ]
 
+        # Capacity-constrained assignment uses exposed census-tract demand
+        # and candidate-facility capacity. It does not claim live traffic,
+        # observed road closures, or route-level congestion.
+        if demand_records:
+            for plan in plans:
+                result = self.supply_demand.allocate(
+                    demand_records,
+                    plan.get("allocations") or [],
+                    vulnerability_weight=vulnerability_weight,
+                )
+                if result.get("status") != "allocated":
+                    plan["supply_demand"] = result
+                    objectives_for_plan = plan["objectives"]
+                    if result.get("total_demand_people"):
+                        if "coverage" in objectives_for_plan:
+                            objectives_for_plan["coverage"] = result["coverage"]
+                        if "unmet_demand" in objectives_for_plan:
+                            objectives_for_plan["unmet_demand"] = result[
+                                "unmet_fraction"
+                            ]
+                        objectives_for_plan["vulnerability_coverage"] = result[
+                            "vulnerability_coverage"
+                        ]
+                        if "risk_reduction" in objectives_for_plan:
+                            objectives_for_plan["risk_reduction"] = 0.0
+                        plan["vulnerability_coverage_computed"] = True
+                    plan["evacuation_feasible"] = False
+                    continue
+                served_people = int(result.get("served_people") or 0)
+                plan["evacuation_feasible"] = served_people > 0
+                plan["supply_demand"] = result
+                objectives_for_plan = plan["objectives"]
+                if "coverage" in objectives_for_plan:
+                    objectives_for_plan["coverage"] = result["coverage"]
+                if "unmet_demand" in objectives_for_plan:
+                    objectives_for_plan["unmet_demand"] = result["unmet_fraction"]
+                objectives_for_plan["vulnerability_coverage"] = result[
+                    "vulnerability_coverage"
+                ]
+                if "risk_reduction" in objectives_for_plan:
+                    severity = _safe_float(
+                        (plan.get("metadata") or {}).get(
+                            "severity_water_ratio_used"
+                        )
+                    )
+                    objectives_for_plan["risk_reduction"] = round(
+                        result["coverage"]
+                        * (severity if severity is not None else 1.0),
+                        6,
+                    )
+                plan["vulnerability_coverage_computed"] = True
+                plan.setdefault("metadata", {})["supply_demand_method"] = result[
+                    "method"
+                ]
+
         self._apply_vulnerability_coverage(plans, svi_tracts)
 
         return plans
@@ -213,7 +276,17 @@ class AllocationEngine:
         radius = self.vulnerability_coverage_radius_km
 
         for plan in plans:
+            if plan.get("vulnerability_coverage_computed"):
+                continue
             allocations = plan.get("allocations") or []
+            if not allocations:
+                # A plan intentionally left with no facilities (e.g. all
+                # excluded by community requirements) covers zero
+                # vulnerable population; that is a result, not a reason to
+                # skip the computation for every other plan.
+                plan["objectives"]["vulnerability_coverage"] = 0.0
+                plan["vulnerability_coverage_computed"] = True
+                continue
             points = [
                 (a["lat"], a["lon"])
                 for a in allocations
@@ -272,12 +345,36 @@ class AllocationEngine:
                     "recommended_plan": None,
                 }
 
+            # Plans that cannot serve anyone (or contain only response-only
+            # facilities) must not remain eligible for an evacuation
+            # recommendation.  With no demand-assignment run, preserve the
+            # original behavior for callers that optimize generic plans.
+            feasibility_evaluated = any(
+                "evacuation_feasible" in plan for plan in plans
+            )
+            eligible_plans = (
+                [
+                    plan for plan in plans
+                    if plan.get("evacuation_feasible") is True
+                ]
+                if feasibility_evaluated
+                else list(plans)
+            )
+            if not eligible_plans:
+                return {
+                    "status": "no_feasible_plan",
+                    "candidate_plan_count": len(plans),
+                    "feasible_plan_count": 0,
+                    "pareto_frontier": [],
+                    "recommended_plan": None,
+                }
+
             # Effective objectives = configured objectives plus the equity
             # coverage objective when actually computed; it is never added
             # otherwise, so weight injection cannot pretend to take effect.
-            objectives = self.effective_objectives(plans)
+            objectives = self.effective_objectives(eligible_plans)
 
-            frontier = pareto_frontier(plans, objectives)
+            frontier = pareto_frontier(eligible_plans, objectives)
 
             if not frontier:
                 return {
@@ -304,6 +401,7 @@ class AllocationEngine:
             return {
                 "status":               "optimized",
                 "candidate_plan_count": len(plans),
+                "feasible_plan_count":  len(eligible_plans),
                 "pareto_plan_count":    len(frontier),
                 "pareto_frontier":      frontier,
                 "recommended_plan":     recommended,
@@ -323,8 +421,6 @@ class AllocationEngine:
 
 
     @staticmethod
-    @staticmethod
-    
     def optimization_allowed(
     
         fused_evidence: dict[str, Any],
@@ -396,4 +492,3 @@ class AllocationEngine:
     # ============================================================
     
     
-

@@ -21,10 +21,11 @@ class FusionSourcesSkill:
 
     name = "flood_fusion_sources"
 
-    # These upstream APIs are current-only (active alerts / latest
-    # forecast / latest observation) with no historical archive endpoint.
-    # In historical replay they are skipped with an audit record: today's
-    # alerts must never be used to explain a past event.
+    # These configured connectors call current/latest endpoints.  Some
+    # upstream products have limited archives, but these tool calls do not
+    # accept an event window.  In historical replay they are skipped with
+    # an audit record: today's alerts or forecast must never be used to
+    # explain a past event.
     CURRENT_ONLY_SOURCE_TYPES = {
         "warning",
         "forecast",
@@ -38,7 +39,6 @@ class FusionSourcesSkill:
         verifier,
         mcp,
         logger,
-        warning_radius_km: float,
         flood_analysis_radius_km: float,
         source_configs: list[dict[str, Any]],
     ):
@@ -46,7 +46,6 @@ class FusionSourcesSkill:
         self.verifier = verifier
         self.mcp = mcp
         self.logger = logger
-        self.warning_radius_km = warning_radius_km
         self.flood_analysis_radius_km = flood_analysis_radius_km
         self.source_configs = source_configs
         self.skipped_historical_sources: list[dict[str, Any]] = []
@@ -81,7 +80,6 @@ class FusionSourcesSkill:
             "station_id": station_id,
             "latitude": location.latitude,
             "longitude": location.longitude,
-            "warning_radius_km": self.warning_radius_km,
             "flood_analysis_radius_km": self.flood_analysis_radius_km,
             # event_date may be injected by the caller (historical replay); defaults to today UTC.
             "event_date": event_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
@@ -111,9 +109,9 @@ class FusionSourcesSkill:
                         "source": name,
                         "source_type": source_type,
                         "reason": (
-                            "current-only API (active alerts / latest "
-                            "forecast / latest observation); no historical "
-                            "archive endpoint — excluded for time alignment"
+                            "configured connector uses an active/latest "
+                            "endpoint and does not accept the event window; "
+                            "excluded for time alignment"
                         ),
                     }
                 )
@@ -121,7 +119,7 @@ class FusionSourcesSkill:
                     "skipped_historical_source",
                     source=name,
                     source_type=source_type,
-                    reason="current_only_api_no_historical_archive",
+                    reason="connector_not_event_time_capable",
                 )
                 return None
 

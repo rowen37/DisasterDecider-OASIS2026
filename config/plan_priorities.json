@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "balanced",
+      "label": "Balanced plan",
+      "description": "Uses the model's configured balance of risk, coverage, equity and cost.",
+      "selector": "recommended"
+    },
+    {
+      "id": "coverage_first",
+      "label": "Serve more people",
+      "description": "Chooses the candidate that serves the largest exposed population.",
+      "rank_by": [
+        {"field": "served_people", "direction": "max"},
+        {"field": "unmet_people", "direction": "min"},
+        {"field": "cost", "direction": "min"}
+      ]
+    },
+    {
+      "id": "vulnerability_first",
+      "label": "Prioritize vulnerable areas",
+      "description": "Chooses the candidate with the lowest vulnerability-weighted unmet need.",
+      "rank_by": [
+        {"field": "vulnerability_weighted_unmet_need", "direction": "min"},
+        {"field": "unmet_people", "direction": "min"},
+        {"field": "cost", "direction": "min"}
+      ]
+    },
+    {
+      "id": "shorter_transfer",
+      "label": "Shorter transfer",
+      "description": "Chooses the candidate with the shortest p95 assignment distance.",
+      "rank_by": [
+        {"field": "travel_distance_p95_km", "direction": "min"},
+        {"field": "served_people", "direction": "max"},
+        {"field": "cost", "direction": "min"}
+      ]
+    }
+  ]
+}

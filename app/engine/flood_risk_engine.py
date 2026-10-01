@@ -22,9 +22,10 @@ Conventions:
   context, not as index factors.
 
 All returned indices are normalized scores (not probabilities or
-forecasts) and retain their component values for audit. Label bands
-are calibrated on the two live extremes (dry-day Friendswood → Low,
-Hurricane Harvey → top bands), not on fixtures.
+forecasts) and retain their component values for audit. The current label
+bands are a versioned project decision policy, not an empirically validated
+forecast model; independent validation therefore reports the continuous
+score separately and lists label-band validation as an open gap.
 """
 
 from __future__ import annotations
@@ -59,9 +60,9 @@ def cdri_risk_label(cdri: float) -> str:
 
     CDRI = hazard × (0.5 + 0.5·exposure) × vulnerability with all
     three factors ∈[0,1]; 1.0 is the physical worst case of every
-    dimension. Bands are calibrated on the two live extremes (dry
-    day → Low, Harvey → Very High): <0.5% Low, 0.5–2% Moderate,
-    2–10% High, ≥10% Very High.
+    dimension. Current versioned decision-policy bands are <0.5% Low,
+    0.5–2% Moderate, 2–10% High, and ≥10% Very High. They are disclosed
+    as unvalidated policy cut points rather than claimed as calibration.
     """
     if cdri < 0.005:
         return "Low"
@@ -148,6 +149,7 @@ class RiskEngine:
 
         # ── Extent severity (physical share) ─────────────────
         _extent_value = _safe_float(flooded_area_km2)
+        modeled_extent = gis_stats.get("extent_provenance") == "modeled_stage_buffer"
         if _extent_value is None:
             data_gaps.append("flooded_area_km2")
             # A missing flooded area must not collapse to a measured 0 —
@@ -162,6 +164,11 @@ class RiskEngine:
         else:
             extent_ratio = _nz(_extent_value / analysis_area_km2)
             extent_severity = extent_ratio  # physical share ∈[0,1] (clipped)
+            if modeled_extent:
+                data_gaps.append("observed_flood_extent")
+                substitutions["flood_extent"] = (
+                    "observed_missing→modeled_stage_buffer"
+                )
 
         # ── Hazard = water dimension ─────────────────────────
         # Water level is available daily and directly measures the
@@ -194,83 +201,66 @@ class RiskEngine:
             svi = _clamp01(_svi_raw)
             vulnerability_unconstrained = False
         total_population = _safe_float(_svi_profile.get("total_population")) or 0.0
-        # Affected population prefers the areal-weighted flood ∩ tract
-        # estimate; fall back to the containing tract's population with
-        # the source disclosed. total_population is the tract population
-        # filtered to the analysis area (city boundary) — same basis as
-        # the numerator (tract granularity; boundary-crossing tracts
-        # count in full).
+        # Affected population is only the census population intersecting the
+        # operational flood extent.  GeometryEngine estimates it as tract
+        # population × flooded-area share.  A containing tract's population is
+        # useful context, but is not flood exposure and must never substitute
+        # for this numerator.
         affected_population = _safe_float(
             gis_stats.get("affected_population")
         )
-        affected_population_source = (
-            (
-                "census_tract_areal_weighted"
-                if gis_stats.get("affected_population_method", "").startswith(
-                    "areal_weighted"
-                )
-                else "census_tract_centroid_in_flood_polygon"
-            )
-            if affected_population is not None
-            else "containing_tract_population"
+        affected_method = str(
+            gis_stats.get("affected_population_method") or ""
         )
         if affected_population is None:
-            affected_population = _safe_float((fused_measurements.get("population_exposure", {}) or {}).get("value")) or 0.0
+            affected_population_source = "unavailable"
+        elif affected_method.startswith("areal_weighted"):
+            affected_population_source = "census_tract_areal_weighted"
+        elif affected_method == "analysis_area_uniform_density":
+            affected_population_source = "analysis_area_uniform_density"
+        else:
+            affected_population_source = affected_method or "unspecified"
         # When the population dimension is missing (no affected estimate
-        # and no tract base), population severity follows the same
+        # or no tract base), population severity follows the same
         # neutral-0.5 + [0,1]-interval convention as vulnerability.
         population_data_missing = (
             total_population is None or total_population <= 0
-        ) or (
-            _safe_float(gis_stats.get("affected_population")) is None
-            and _safe_float(
-                (fused_measurements.get("population_exposure", {}) or {}).get("value")
-            )
-            is None
-        )
+        ) or affected_population is None
         if population_data_missing:
+            data_gaps.append("affected_population_or_total_population")
             substitutions["population_severity"] = "missing→neutral_0.5"
             population_factor = 0.5
             population_severity = 0.5
         else:
             population_factor = _nz(affected_population / total_population) if total_population else 0.0
             population_severity = population_factor  # physical share ∈[0,1]
-        # Facility factor: affected facilities / total facilities in the
-        # analysis area (fall back to the absolute count normalized by a
-        # reference value when no affected statistic exists).
+        # Both facility counts must refer to the same locatable OSM inventory.
         affected_facilities = _safe_float(
             gis_stats.get("affected_facilities")
         )
-        nearby_facilities = _safe_float(
-            (fused_measurements.get("facility_count", {}) or {}).get("value")
+        facility_inventory_count = _safe_float(
+            gis_stats.get("facility_inventory_count")
         )
-        facility_data_missing = False
+        facility_data_missing = True
         if (
             affected_facilities is not None
-            and nearby_facilities
-            and nearby_facilities > 0
+            and facility_inventory_count is not None
+            and facility_inventory_count > 0
+            and 0 <= affected_facilities <= facility_inventory_count
         ):
-            facility_factor = _nz(affected_facilities / nearby_facilities)
-        elif affected_facilities is None:
-            # Affected count unknown (POI ∩ flood intersection failed or
-            # missing this round): the nearby absolute count is retrieval
-            # density, not an exposure share. A missing dimension follows
-            # the system-wide convention: neutral 0.5 + data_gaps
-            # disclosure + interval spanning [0,1].
+            facility_factor = affected_facilities / facility_inventory_count
+            facility_data_missing = False
+        elif affected_facilities == 0 and facility_inventory_count == 0:
+            facility_factor = 0.0
+            facility_data_missing = False
+        else:
+            # A count from another search radius or an arbitrary reference
+            # value cannot establish the flooded share of this inventory.
             data_gaps.append("affected_facilities")
             substitutions["facility_factor"] = (
-                "affected_facilities missing→neutral_0.5"
+                "affected_facilities missing or inventory mismatch→neutral_0.5"
             )
-            facility_data_missing = True
             facility_factor = 0.5
-        else:
-            # Known affected count but missing denominator: normalize the
-            # absolute count by the reference value 100 (existing
-            # convention).
-            facility_count = nearby_facilities or 0.0
-            if nearby_facilities is None:
-                substitutions["facility_factor"] = "missing→0"
-            facility_factor = _nz(facility_count / 100.0)
         facility_severity = _clamp01(facility_factor)  # physical share, sanitized
         # Exposure = worst share across affected elements.
         exposure = max(population_severity, facility_severity)
@@ -279,6 +269,14 @@ class RiskEngine:
         # Road density and route access are still computed and reported
         # for response-resource planning, but are not index factors.
         road_count = _safe_float((fused_measurements.get("road_count", {}) or {}).get("value"))
+        road_impact = _safe_float(gis_stats.get("affected_roads"))
+        road_impact_available = (
+            road_count is not None and road_count >= 0
+            and road_impact is not None and road_impact >= 0
+        )
+        if not road_impact_available:
+            data_gaps.append("road_impact")
+            substitutions["road_impact"] = "missing→not_available_for_planning"
         if road_count is None:
             road_count = 0.0
             substitutions["road_density_factor"] = "missing→0"
@@ -331,17 +329,47 @@ class RiskEngine:
             * ((1.0 + svi) / 2.0)
             * ((1.0 + population_severity) / 2.0)
         )  # water_severity is a saturated map ∈[0,1); EPS ∈[0,1)
-        quality_values = [
-            _safe_float(item.get("quality_score"))
-            for item in observations
-            if isinstance(item, dict) and _safe_float(item.get("quality_score")) is not None
+        # Count each independent source once.  Multi-variable sources such as
+        # OSM otherwise receive several votes merely because they return more
+        # fields. The four completeness dimensions follow the paper's
+        # flood area, population, facilities, and roads. A modeled area is
+        # available for planning but is not a complete observed extent.
+        quality_by_source: dict[str, list[float]] = {}
+        for item in observations:
+            if not isinstance(item, dict):
+                continue
+            quality = _safe_float(item.get("quality_score"))
+            if quality is None:
+                continue
+            source = str(item.get("source") or "unknown")
+            quality_by_source.setdefault(source, []).append(quality)
+        source_quality = [
+            sum(values) / len(values)
+            for values in quality_by_source.values()
+            if values
         ]
-        quality_mean = sum(quality_values) / len(quality_values) if quality_values else 0.0
-        completeness = sum((flooded_area_km2 is not None, total_population > 0, (nearby_facilities or 0) > 0, road_count > 0)) / 4.0
+        quality_mean = (
+            sum(source_quality) / len(source_quality)
+            if source_quality
+            else 0.0
+        )
+        completeness_components = {
+            "observed_flood_extent": (
+                _extent_value is not None and not modeled_extent
+            ),
+            "affected_population": (
+                affected_population is not None and total_population > 0
+            ),
+            "affected_facilities": not facility_data_missing,
+            "road_impact": road_impact_available,
+        }
+        completeness = sum(completeness_components.values()) / len(
+            completeness_components
+        )
         data_confidence = _clamp01(0.7 * quality_mean + 0.3 * completeness)
 
-        # First-order component-perturbation envelope: how much ±10% of
-        # each component can move CDRI. Missing components (neutral
+        # First-order component-perturbation envelope: how much an absolute
+        # ±0.1 shift in each normalized component can move CDRI. Missing components (neutral
         # placeholders) go into the unconstrained list — their interval
         # spans [0,1], honestly expressing "this input is unknown".
         _unconstrained: list[str] = []
@@ -368,7 +396,19 @@ class RiskEngine:
             "data_gaps": data_gaps,
             "substitutions": substitutions,
             "cdri_risk_label": cdri_risk_label_value,
+            "cdri_label_policy": {
+                "version": "project-policy-v1",
+                "cut_points": [0.005, 0.02, 0.10],
+                "validation_status": "not_independently_validated",
+                "decision_use": "screening_only",
+            },
             "eps": round(eps, 4), "data_confidence": round(data_confidence, 4),
+            "data_confidence_detail": {
+                "evidence_quality_mean": round(quality_mean, 4),
+                "completeness": round(completeness, 4),
+                "completeness_components": completeness_components,
+                "formula": "0.7 * evidence_quality_mean + 0.3 * completeness",
+            },
             "uncertainty": uncertainty,
             "components": {
                 "hazard": round(hazard, 4),

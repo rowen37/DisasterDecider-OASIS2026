@@ -58,6 +58,78 @@ def _error_payload(exc: Exception) -> str:
 
 
 @mcp.tool()
+async def get_waterway_network(latitude: float, longitude: float, radius_km: float = 15) -> str:
+    """
+    Get OSM waterway polylines (river / stream / canal) near a point.
+
+    Used by the stage-buffer fallback: when satellite imagery is
+    missing or mistimed but the gauge peak confirms flooding, the
+    waterway geometry feeds a first-order hydraulic-proximity extent.
+
+    Args:
+        latitude: latitude of the anchor point (usually the station)
+        longitude: longitude of the anchor point
+        radius_km: search radius (km)
+    """
+    radius_m = radius_km * 1000
+
+    query = f"""
+    [out:json][timeout:25];
+    (
+      way["waterway"~"^(river|canal|stream)$"](around:{int(radius_m)},{latitude},{longitude});
+    );
+    out geom;
+    """
+
+    try:
+        data, diag = await _run_overpass(query)
+    except Exception as exc:
+        return json.dumps({"status": "error", "error": _error_payload(exc)})
+
+    MAX_WATERWAYS = 400
+    waterways = []
+    for element in data.get("elements", []):
+        if element.get("type") != "way":
+            continue
+        geometry = element.get("geometry")
+        if not (isinstance(geometry, list) and len(geometry) >= 2):
+            continue
+        coordinates = [
+            [point["lon"], point["lat"]]
+            for point in geometry
+            if isinstance(point, dict)
+            and isinstance(point.get("lon"), (int, float))
+            and isinstance(point.get("lat"), (int, float))
+        ]
+        if len(coordinates) < 2:
+            continue
+        tags = element.get("tags", {})
+        waterways.append({
+            "osm_id": element.get("id"),
+            "name": tags.get("name"),
+            "waterway": tags.get("waterway"),
+            "coordinates": coordinates,
+        })
+
+    return json.dumps({
+        "status": "ok",
+        "source": "OSM",
+        "source_type": "waterway_network",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "location": {"latitude": latitude, "longitude": longitude},
+        "waterways": waterways[:MAX_WATERWAYS],
+        "waterway_count": len(waterways),
+        "waterways_truncated": len(waterways) > MAX_WATERWAYS,
+        "radius_km": radius_km,
+        "metadata": {
+            "overpass_endpoint": diag.get("endpoint"),
+            "overpass_stale": bool(diag.get("stale")),
+        },
+        "metadata_verified": True,
+    })
+
+
+@mcp.tool()
 async def get_road_status(latitude: float, longitude: float, radius_km: float = 10) -> str:
     """
     Get the road network status near a given location (via OSM).

@@ -18,7 +18,7 @@ async def get_population_exposure(
     radius_km: float = 10,
 ) -> str:
     """
-    Get a population exposure estimate near a given location.
+    Get population context for the census tract containing a location.
 
     Data sources:
         1. Census Geocoder - converts lat/lon to FIPS codes (state, county, tract)
@@ -130,7 +130,8 @@ async def get_population_exposure(
     return json.dumps({
         "status": "ok",
         "source": "Census ACS 5-Year 2020",
-        "source_type": "population_exposure",
+        "source_type": "population_context",
+        "population_role": "containing_tract_population",
         "location": {
             "latitude": latitude,
             "longitude": longitude

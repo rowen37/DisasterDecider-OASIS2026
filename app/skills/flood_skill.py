@@ -22,6 +22,9 @@ from .fusion import (
 
 # Engine layer (pure computation) and atomic skills (pluggable data units)
 from ..engine.allocation_engine import AllocationEngine
+from ..engine.evacuation_policy import (
+    DEFAULT_ELIGIBLE_FACILITY_TYPES,
+)
 from ..engine.flood_fusion_engine import fuse_flood_evidence
 from ..engine.geometry_engine import GeometryEngine
 from ..engine.flood_risk_engine import RiskEngine
@@ -32,13 +35,15 @@ from .svi_skill import SviSkill
 from .usgs_skill import UsgsSkill
 from ..hitl import AdaptiveHITL
 from ..mcp_client import MCPManager
+from ..plan_scenarios import build_plan_scenarios
 from ..social_good import (
     SocialGoodError,
     build_demand_records,
+    compute_coverage_concentration_index_or_none,
     compute_equity_gap,
     compute_equity_gap_or_none,
+    compute_normalized_vulnerability_weighted_unmet_need,
     compute_vulnerability_weighted_unmet_need,
-    demand_impacts_for_plan,
     vulnerability_profile,
 )
 from .registry import register_skill
@@ -370,9 +375,59 @@ threshold or validated model is present in the evidence.
         self.gis_flood_buffer_m = float(
             os.getenv("GIS_FLOOD_BUFFER_METERS", "350")
         )
-        self.gis_search_radius_poi_m = float(
-            os.getenv("GIS_SEARCH_RADIUS_POI_KM", "5")
-        ) * 1000.0
+        # Facility service-area policy.  These are disclosed planning
+        # assumptions, not observed traffic speeds: search the 30-minute
+        # service area first, then expand to 60 minutes only when the
+        # primary search is empty.
+        try:
+            self.facility_planning_speed_kmh = float(
+                os.getenv("GIS_FACILITY_PLANNING_SPEED_KMH", "30")
+            )
+            self.facility_primary_service_minutes = float(
+                os.getenv("GIS_FACILITY_PRIMARY_SERVICE_MINUTES", "30")
+            )
+            self.facility_extended_service_minutes = float(
+                os.getenv("GIS_FACILITY_EXTENDED_SERVICE_MINUTES", "60")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "GIS facility service-area settings must be numeric."
+            ) from exc
+
+        facility_policy_values = (
+            self.facility_planning_speed_kmh,
+            self.facility_primary_service_minutes,
+            self.facility_extended_service_minutes,
+        )
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in facility_policy_values
+        ):
+            raise RuntimeError(
+                "GIS facility service-area settings must be finite "
+                "positive numbers."
+            )
+        if (
+            self.facility_extended_service_minutes
+            < self.facility_primary_service_minutes
+        ):
+            raise RuntimeError(
+                "GIS_FACILITY_EXTENDED_SERVICE_MINUTES must be greater "
+                "than or equal to GIS_FACILITY_PRIMARY_SERVICE_MINUTES."
+            )
+
+        self.gis_search_radius_poi_m = (
+            self.facility_planning_speed_kmh
+            * self.facility_primary_service_minutes
+            / 60.0
+            * 1000.0
+        )
+        self.gis_search_radius_poi_extended_m = (
+            self.facility_planning_speed_kmh
+            * self.facility_extended_service_minutes
+            / 60.0
+            * 1000.0
+        )
         # Near-field building survey radius (distinct from the POI radius; separately configurable)
         self.gis_search_radius_buildings_m = float(
             os.getenv("GIS_SEARCH_RADIUS_BUILDINGS_M", "3000")
@@ -383,6 +438,38 @@ threshold or validated model is present in the evidence.
         )
         self.gis_route_avoid_flood = (
             os.getenv("GIS_ROUTE_AVOID_FLOOD", "true").lower() == "true"
+        )
+        # Modeled stage-buffer fallback: OSM waterway search radius and
+        # the radius anchors (km) at action / minor / moderate exceedance.
+        # These are disclosed planning-policy constants, not hydraulics.
+        self.waterway_search_radius_km = float(
+            os.getenv("WATERWAY_SEARCH_RADIUS_KM", "15")
+        )
+        self.stage_buffer_base_km = float(
+            os.getenv("STAGE_BUFFER_BASE_KM", "0.15")
+        )
+        self.stage_buffer_minor_km = float(
+            os.getenv("STAGE_BUFFER_MINOR_KM", "0.4")
+        )
+        self.stage_buffer_moderate_km = float(
+            os.getenv("STAGE_BUFFER_MODERATE_KM", "0.8")
+        )
+        self.stage_buffer_max_km = float(
+            os.getenv("STAGE_BUFFER_MAX_KM", "1.5")
+        )
+        # Waterway selection near the gauge: how many nearest ways to
+        # buffer, and the radius fraction applied to small streams.
+        self.stage_buffer_max_waterways = int(
+            os.getenv("STAGE_BUFFER_MAX_WATERWAYS", "5")
+        )
+        self.stage_buffer_stream_fraction = float(
+            os.getenv("STAGE_BUFFER_STREAM_FRACTION", "0.4")
+        )
+        # Waterways farther than this from the gauge are outside the
+        # modeled corridor entirely (the stage reading says nothing
+        # about them).
+        self.stage_buffer_max_corridor_km = float(
+            os.getenv("STAGE_BUFFER_MAX_CORRIDOR_KM", "10")
         )
         # Optional event date (YYYY-MM-DD): when unset, fusion sources
         # fetch "today UTC"; when set, historical replay is enabled.
@@ -416,17 +503,6 @@ threshold or validated model is present in the evidence.
         self.sar_stage_contradiction_share = float(
             os.getenv("SAR_STAGE_CONTRADICTION_SHARE", "0.05")
         )
-        # Coverage-radius sensitivity sweep (km, comma-separated): makes
-        # the equity metrics' dependence on R explicit; VWUN/equity gap
-        # are recomputed per radius for the recommended plan.
-        self.coverage_radius_sweep = [
-            float(v)
-            for v in os.getenv(
-                "VULNERABILITY_COVERAGE_RADIUS_SWEEP", "2,5,10"
-            ).split(",")
-            if v.strip()
-        ]
-
         self.flood_analysis_radius_km = float(
             os.getenv("GEE_FLOOD_ANALYSIS_RADIUS_KM", "10")
         )
@@ -449,35 +525,6 @@ threshold or validated model is present in the evidence.
                 "a finite positive number."
             )
 
-        warning_radius_policy = os.getenv(
-            "NWS_WARNING_RADIUS_KM"
-        )
-
-        if warning_radius_policy is None:
-            raise RuntimeError(
-                "NWS_WARNING_RADIUS_KM is not configured."
-            )
-
-        try:
-            self.nws_warning_radius_km = float(
-                warning_radius_policy
-            )
-        except ValueError as exc:
-            raise RuntimeError(
-                "NWS_WARNING_RADIUS_KM must be numeric."
-            ) from exc
-
-        if (
-            not math.isfinite(
-                self.nws_warning_radius_km
-            )
-            or self.nws_warning_radius_km <= 0
-        ):
-            raise RuntimeError(
-                "NWS_WARNING_RADIUS_KM must be "
-                "a finite positive number."
-            )
-        
         self.svi_tool = os.getenv(
             "SVI_TOOL",
             "get_social_vulnerability",
@@ -502,6 +549,13 @@ threshold or validated model is present in the evidence.
         # -- Four-layer decoupling assembly -------------------------
         # Engine: pure resource-allocation computation (objectives /
         # weights / caps injected from configuration)
+        _speed_min = _safe_float(os.getenv("EVACUATION_PLANNING_SPEED_MIN_KMH"))
+        _speed_max = _safe_float(os.getenv("EVACUATION_PLANNING_SPEED_MAX_KMH"))
+        _speed_range = (
+            (_speed_min, _speed_max)
+            if _speed_min is not None and _speed_max is not None
+            else None
+        )
         self.allocation = AllocationEngine(
             objectives=self.allocation_objectives,
             weights=self.allocation_weights,
@@ -509,11 +563,15 @@ threshold or validated model is present in the evidence.
             vulnerability_coverage_radius_km=float(
                 os.getenv("VULNERABILITY_COVERAGE_RADIUS_KM", "10")
             ),
+            planning_speed_range_kmh=_speed_range,
+            eligible_facility_types=os.getenv(
+                "EVACUATION_DESTINATION_TYPES",
+                ",".join(DEFAULT_ELIGIBLE_FACILITY_TYPES),
+            ),
         )
         # Atomic skills: multi-source collection / SVI / resource discovery
         self.sources = FusionSourcesSkill(
             state, verifier, mcp, logger,
-            warning_radius_km=self.nws_warning_radius_km,
             flood_analysis_radius_km=self.flood_analysis_radius_km,
             source_configs=self.fusion_sources,
         )
@@ -583,6 +641,10 @@ threshold or validated model is present in the evidence.
             "water_level": float(stage_ft),
             "unit": str(units or "ft"),
             "observation_time": valid_time or utc_now().isoformat(),
+            # NWPS stageflow has no archive endpoint, so this fallback
+            # is realtime-only and always a latest-instantaneous value.
+            "observation_semantics": "latest_instantaneous",
+            "window_summary": None,
             "source": "NOAA/NWS NWPS stageflow (USGS IV unavailable)",
             "station_name": gauge.get("name"),
             "latitude": gauge.get("latitude"),
@@ -604,6 +666,111 @@ threshold or validated model is present in the evidence.
             },
         }
 
+
+    async def _build_modeled_extent(
+        self,
+        *,
+        location: Location,
+        station_location: Location | None,
+        peak_stage_ft: float | None,
+        action_stage_ft: float | None,
+        minor_stage_ft: float | None,
+        moderate_stage_ft: float | None,
+        city_boundary_geojson: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Build the modeled stage-buffer flood extent (fallback layer).
+
+        Fetches the OSM waterway network around the station (the gauge
+        sits on the river it measures, so the station is the natural
+        anchor), buffers it via GeometryEngine.build_stage_buffer_extent,
+        and clips to the city boundary when available.
+
+        Returns None when there is nothing to model (no waterways / no
+        positive exceedance); raises on tool or geometry failure so the
+        caller discloses the concrete error.
+        """
+        if peak_stage_ft is None or action_stage_ft is None:
+            return None
+        anchor = station_location or location
+        raw = await self.mcp.call(
+            "get_waterway_network",
+            {
+                "latitude": anchor.latitude,
+                "longitude": anchor.longitude,
+                "radius_km": self.waterway_search_radius_km,
+            },
+            timeout=45.0,
+            max_retries=1,
+        )
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "get_waterway_network returned an invalid structure."
+            )
+        if data.get("status") != "ok":
+            raise RuntimeError(
+                "get_waterway_network failed: "
+                + str(data.get("error", "unknown error"))
+            )
+        waterways = data.get("waterways") or []
+        if not waterways:
+            return None
+        built = self.geometry.build_stage_buffer_extent(
+            waterways=waterways,
+            peak_stage_ft=peak_stage_ft,
+            action_stage_ft=action_stage_ft,
+            minor_stage_ft=minor_stage_ft,
+            moderate_stage_ft=moderate_stage_ft,
+            base_km=self.stage_buffer_base_km,
+            minor_km=self.stage_buffer_minor_km,
+            moderate_km=self.stage_buffer_moderate_km,
+            max_km=self.stage_buffer_max_km,
+            # The gauge measures one river: anchor the buffer on the
+            # nearest waterways to the station, not the whole urban
+            # stream network.
+            anchor=(anchor.latitude, anchor.longitude),
+            max_waterways=self.stage_buffer_max_waterways,
+            stream_fraction=self.stage_buffer_stream_fraction,
+            max_corridor_km=self.stage_buffer_max_corridor_km,
+        )
+        if built is None or not (
+            built.geojson.get("features")
+        ):
+            return None
+        model = dict(built.model)
+        result: dict[str, Any] = {
+            "geojson": built.geojson,
+            "flooded_area_km2": built.area_km2,
+            "union_geom": built.union_geom,
+            "city_area_km2": None,
+            "city_boundary_geom": None,
+            "model": model,
+        }
+        if city_boundary_geojson:
+            clip = self.geometry.clip_flood_extent_to_city(
+                city_boundary_geojson,
+                built.geojson,
+            )
+            if clip is not None:
+                result.update(
+                    {
+                        "geojson": clip.clipped_geojson,
+                        "flooded_area_km2": clip.flooded_area_km2,
+                        "union_geom": clip.flood_union_geom,
+                        "city_area_km2": clip.city_area_km2,
+                        "city_boundary_geom": clip.city_boundary_geom,
+                    }
+                )
+                model["clipped_to_city"] = True
+            else:
+                # Zero overlap with the city boundary: keep the
+                # unclipped buffer (advisory posture) and disclose it.
+                model["clipped_to_city"] = False
+                model["clip_note"] = (
+                    "modeled buffer had zero overlap with the city "
+                    "boundary; unclipped buffer retained"
+                )
+        return result
 
     # ============================================================
     # Multi-source data acquisition
@@ -680,6 +847,9 @@ threshold or validated model is present in the evidence.
                 "equity_ledger": optimization.get(
                     "equity_ledger"
                 ),
+                "plan_scenarios": optimization.get(
+                    "plan_scenarios", []
+                ),
                 "objectives": (
                     self.allocation_objectives
                 ),
@@ -700,8 +870,6 @@ threshold or validated model is present in the evidence.
         if overrides:
             if 'station_max_distance_km' in overrides:
                 self.station_max_distance_km = float(overrides['station_max_distance_km'])
-            if 'nws_warning_radius_km' in overrides:
-                self.nws_warning_radius_km = float(overrides['nws_warning_radius_km'])
             if 'svi_radius_km' in overrides:
                 self.svi_radius_km = float(overrides['svi_radius_km'])
             if 'vulnerability_weight' in overrides:
@@ -1154,6 +1322,13 @@ threshold or validated model is present in the evidence.
                 "water_level": observation["water_level"],
                 "unit": observation["unit"],
                 "observation_time": observation["observation_time"],
+                # Snapshot semantics: "window_peak" (historical replay:
+                # the event stage is the window PEAK; full hydrograph in
+                # window_summary) or "latest_instantaneous" (realtime).
+                "observation_semantics": observation.get(
+                    "observation_semantics"
+                ),
+                "window_summary": observation.get("window_summary"),
                 "retrieved_at": retrieved_at.isoformat(),
 
                 # Provenance
@@ -1567,7 +1742,6 @@ threshold or validated model is present in the evidence.
                         "area": props.get("areaDesc"),
                         "headline": (props.get("headline") or "")[:200],
                         "expires": props.get("expires"),
-                        "distance_km": a.get("_distance_to_center_km"),
                     }
                     for a in al_list[:10]
                     if isinstance(a, dict)
@@ -1584,7 +1758,7 @@ threshold or validated model is present in the evidence.
                         source=str(al_item.get("source", "NWS")),
                         observation=(
                             f"{len(al_list)} active NWS alert(s) "
-                            "within the warning radius."
+                            "applying to the target point."
                         ),
                         timestamp=al_item.get("timestamp"),
                         quality_score=_safe_float(
@@ -1639,6 +1813,93 @@ threshold or validated model is present in the evidence.
                     )
                 )
 
+            # A Sentinel-1 change footprint is not, by itself, confirmation
+            # of current flooding. It may represent wet soil, vegetation,
+            # acquisition-geometry differences, or standing water. Promote it
+            # to an operational flood extent only when an authoritative signal
+            # corroborates it. Corroborators, in priority order:
+            #   1. gauge at/above its official action stage -- judged on
+            #      the WINDOW PEAK in historical replay (a flash flood that
+            #      recedes inside the event window must not be acquitted by
+            #      its window-end snapshot; Lodi NJ 2026-09-13 case) and on
+            #      the latest instantaneous value in realtime mode;
+            #   2. an active NWS flood warning (realtime only: historical
+            #      replay skips the current-only alerts source);
+            #   3. observed heavy precipitation (realtime only): rainfall
+            #      is the driver variable and, like the gauge, is more
+            #      current than any satellite revisit.
+            _extent_stage = _safe_float(observation.get("water_level"))
+            _extent_window = observation.get("window_summary")
+            if isinstance(_extent_window, dict):
+                _extent_peak = _safe_float(
+                    _extent_window.get("peak_stage_ft")
+                )
+                if _extent_peak is not None:
+                    _extent_stage = (
+                        max(_extent_stage, _extent_peak)
+                        if _extent_stage is not None
+                        else _extent_peak
+                    )
+            _extent_action = _safe_float(
+                (nwps_gauge.get("flood_categories", {}).get("action", {}) or {}).get(
+                    "stage"
+                )
+            )
+            _extent_alert_count = sum(
+                len(item.get("alerts") or [])
+                for item in fused_evidence.get("alerts", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("alerts") or [], list)
+            )
+            # Heavy observed rainfall (mm) from any fused precipitation
+            # variable. Flash-flood guidance scale (~1 inch/6h) chosen
+            # as the default corroboration floor; configurable.
+            _extent_precip_mm = None
+            for _precip_var, _precip_fused in (
+                fused_evidence.get("fused_measurements") or {}
+            ).items():
+                if "precipitation" not in str(_precip_var):
+                    continue
+                _pv = _safe_float(
+                    (_precip_fused or {}).get("value")
+                    if isinstance(_precip_fused, dict)
+                    else None
+                )
+                if _pv is not None:
+                    _extent_precip_mm = max(
+                        _extent_precip_mm or 0.0, _pv
+                    )
+            _extent_precip_floor_mm = _safe_float(
+                os.environ.get("PRECIPITATION_CORROBORATION_MM", "25")
+            )
+            if _extent_precip_floor_mm is None:
+                _extent_precip_floor_mm = 25.0
+            _extent_corroboration = []
+            if (
+                _extent_stage is not None
+                and _extent_action is not None
+                and _extent_stage >= _extent_action
+            ):
+                _extent_corroboration.append("gauge_at_or_above_action_stage")
+            if _extent_alert_count > 0:
+                _extent_corroboration.append("active_nws_flood_warning")
+            if (
+                _extent_precip_mm is not None
+                and _extent_precip_mm >= _extent_precip_floor_mm
+            ):
+                _extent_corroboration.append("heavy_precipitation_observed")
+            _sar_extent_corroborated = bool(_extent_corroboration)
+            # Gauge-confirmed flood trigger (verified thresholds only):
+            # authorizes the modeled stage-buffer fallback extent when
+            # the satellite layer is unusable. An unverified action
+            # stage must never manufacture a flood map.
+            _gauge_flood_triggered = bool(
+                nwps_gauge.get("threshold_verified")
+                and _extent_stage is not None
+                and _extent_action is not None
+                and _extent_stage >= _extent_action
+            )
+
             for obs_item in fused_evidence.get("observations", []):
 
                 if not isinstance(obs_item, dict):
@@ -1657,6 +1918,18 @@ threshold or validated model is present in the evidence.
                 gee_source: str = str(obs_item.get("source", "GEE Sentinel-1"))
                 gee_ts:     str = str(obs_item.get("timestamp", ""))
 
+                obs_item["operational_status"] = (
+                    "corroborated_flood_extent"
+                    if _sar_extent_corroborated
+                    else "unverified_surface_water_candidate"
+                )
+                obs_item["corroboration_basis"] = list(
+                    _extent_corroboration
+                )
+
+                if not _sar_extent_corroborated:
+                    break
+
                 self.state.add_object(
                     SpatialObject(
                         object_id="flood_inundation_extent",
@@ -1669,6 +1942,7 @@ threshold or validated model is present in the evidence.
                             "flooded_area_km2": flooded_area,
                             "confidence":       gee_confidence,
                             "unit":             "km2",
+                            "extent_provenance": "satellite_sar",
                         },
                     )
                 )
@@ -1761,7 +2035,13 @@ threshold or validated model is present in the evidence.
                             and city_area_km2
                             and city_area_km2 > 0
                             and _plausible_cap > 0
-                            and (_stage_now is None or _stage_now <= _action_now)
+                            and (
+                                _stage_now is None
+                                or (
+                                    _action_now is not None
+                                    and _stage_now <= _action_now
+                                )
+                            )
                             and gee_flooded_area_km2 / city_area_km2
                             >= _plausible_cap
                         ):
@@ -1924,6 +2204,7 @@ threshold or validated model is present in the evidence.
                 gee_geojson
                 and isinstance(gee_geojson, dict)
                 and gee_geojson.get("features")
+                and analysis_boundary_geom is not None
                 and gee_acquisition_time
                 and str(gee_acquisition_time).strip().lower()
                 not in ("", "none", "null")
@@ -1932,7 +2213,46 @@ threshold or validated model is present in the evidence.
                     or gee_post_scene_count > 0
                 )
                 and gee_lag_ok
+                and _sar_extent_corroborated
             )
+
+            if (
+                gee_geojson
+                and isinstance(gee_geojson, dict)
+                and gee_geojson.get("features")
+                and not _sar_extent_corroborated
+            ):
+                _candidate_area = _safe_float(gee_flooded_area_km2)
+                if _candidate_area is not None:
+                    gis_results["stats"][
+                        "unverified_surface_water_area_km2"
+                    ] = round(_candidate_area, 4)
+                validation_issues.append(
+                    ValidationIssue(
+                        severity="warning",
+                        code="SAR_EXTENT_UNCORROBORATED",
+                        message=(
+                            "Sentinel-1 detected a backscatter-change footprint, "
+                            "but the gauge is below its official action stage and "
+                            "there is no active NWS flood warning. The footprint "
+                            "is retained only as an unverified candidate and is "
+                            "excluded from the flood map, exposure calculation, "
+                            "routing, and resource planning inputs."
+                        ),
+                        field="flood_inundation_extent",
+                    )
+                )
+                self.state.log(
+                    "sar_extent_uncorroborated",
+                    candidate_area_km2=_candidate_area,
+                    stage_ft=_extent_stage,
+                    action_ft=_extent_action,
+                    active_flood_alert_count=_extent_alert_count,
+                    action="excluded_from_operational_analysis",
+                )
+                gee_flooded_area_km2 = None
+                flood_union_geom = None
+                gee_geojson = {"type": "FeatureCollection", "features": []}
 
             if gee_lag_days is not None and not gee_lag_ok:
                 validation_issues.append(
@@ -1976,18 +2296,30 @@ threshold or validated model is present in the evidence.
             if (
                 gee_geojson
                 and isinstance(gee_geojson, dict)
+                and gee_geojson.get("features")
                 and not gee_extent_usable
             ):
+                missing_local_scope = analysis_boundary_geom is None
                 validation_issues.append(
                     ValidationIssue(
                         severity="warning",
-                        code="UNVERIFIED_FLOOD_EXTENT",
+                        code=(
+                            "SATELLITE_TARGET_SCOPE_UNVERIFIED"
+                            if missing_local_scope
+                            else "UNVERIFIED_FLOOD_EXTENT"
+                        ),
                         message=(
-                            "GEE flood extent has no verifiable "
-                            "satellite acquisition time "
-                            f"(acquisition_time={gee_acquisition_time!r}, "
-                            f"post_scene_count={gee_post_scene_count!r}); "
-                            "downstream GIS analysis was skipped."
+                            "Satellite water was detected in the search area, "
+                            "but its overlap with the target city could not "
+                            "be verified; it is not a local flood extent."
+                            if missing_local_scope
+                            else (
+                                "GEE flood extent has no verifiable "
+                                "satellite acquisition time "
+                                f"(acquisition_time={gee_acquisition_time!r}, "
+                                f"post_scene_count={gee_post_scene_count!r}); "
+                                "downstream GIS analysis was skipped."
+                            )
                         ),
                         field="flood_inundation_extent",
                     )
@@ -1998,6 +2330,213 @@ threshold or validated model is present in the evidence.
                     post_scene_count=gee_post_scene_count,
                     action="gis_analysis_skipped",
                 )
+
+            # ---- 1c. Modeled fallback extent (fail-loud degradation) --
+            # Design posture: prefer an over-wide advisory polygon with
+            # full disclosure over a clean "no extent" miss. When the
+            # satellite layer is unusable (absent, misaligned, or
+            # uncorroborated) but the VERIFIED gauge peak shows the
+            # event reached action stage, build a first-order
+            # stage-buffer extent around the OSM waterway network so
+            # the spatial products (map, exposure, routes, equity)
+            # survive. The layer is labeled modeled everywhere it
+            # surfaces and never claims to be observed inundation.
+            extent_provenance = (
+                "satellite_sar" if gee_extent_usable else None
+            )
+            if gee_extent_usable:
+                gis_results["stats"]["extent_provenance"] = (
+                    "satellite_sar"
+                )
+            else:
+                # The satellite candidate was stored before clipping and
+                # time checks. It is not an operational flood extent when
+                # those checks fail, including zero overlap with the city.
+                self.state.spatial_objects.pop(
+                    "flood_inundation_extent", None
+                )
+            if not gee_extent_usable and _gauge_flood_triggered:
+                _fallback_error: str | None = None
+                _fallback = None
+                try:
+                    _fallback = await self._build_modeled_extent(
+                        location=location,
+                        station_location=station_location,
+                        peak_stage_ft=_extent_stage,
+                        action_stage_ft=_extent_action,
+                        minor_stage_ft=_safe_float(
+                            (nwps_gauge.get("flood_categories", {}).get("minor", {}) or {}).get("stage")
+                        ),
+                        moderate_stage_ft=_safe_float(
+                            (nwps_gauge.get("flood_categories", {}).get("moderate", {}) or {}).get("stage")
+                        ),
+                        city_boundary_geojson=city_boundary_geojson,
+                    )
+                except Exception as fallback_err:
+                    _fallback_error = str(fallback_err)
+                    self.state.log(
+                        "extent_fallback_error",
+                        error=_fallback_error,
+                    )
+                if _fallback is not None:
+                    gee_geojson = _fallback["geojson"]
+                    gee_flooded_area_km2 = _fallback["flooded_area_km2"]
+                    flood_union_geom = _fallback["union_geom"]
+                    if _fallback.get("city_area_km2"):
+                        city_area_km2 = _fallback["city_area_km2"]
+                    if _fallback.get("city_boundary_geom") is not None:
+                        analysis_boundary_geom = _fallback[
+                            "city_boundary_geom"
+                        ]
+                    _extent_window_peak_time = None
+                    if isinstance(_extent_window, dict):
+                        _extent_window_peak_time = (
+                            _extent_window.get("peak_time")
+                        )
+                    gee_acquisition_time = (
+                        _extent_window_peak_time
+                        or observation.get("observation_time")
+                    )
+                    gee_extent_usable = True
+                    extent_provenance = "modeled_stage_buffer"
+                    gis_results["stats"]["extent_provenance"] = (
+                        "modeled_stage_buffer"
+                    )
+                    gis_results["stats"]["extent_model"] = _fallback[
+                        "model"
+                    ]
+                    self.state.add_object(
+                        SpatialObject(
+                            object_id="flood_inundation_extent",
+                            object_type="flood_extent",
+                            geometry=gee_geojson,
+                            crs="EPSG:4326",
+                            source=(
+                                "Modeled stage-buffer extent "
+                                "(OSM waterways × NWPS stage categories)"
+                            ),
+                            timestamp=(
+                                gee_acquisition_time
+                                or utc_now().isoformat()
+                            ),
+                            attributes={
+                                "flooded_area_km2": gee_flooded_area_km2,
+                                "unit": "km2",
+                                "extent_provenance": (
+                                    "modeled_stage_buffer"
+                                ),
+                                "model": _fallback["model"],
+                            },
+                        )
+                    )
+                    validation_issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            code="EXTENT_FALLBACK_MODELED",
+                            message=(
+                                "Satellite flood extent is unusable "
+                                "(absent, misaligned, or uncorroborated) "
+                                "while the verified gauge peak "
+                                f"({_extent_stage} ft) reached action "
+                                f"stage ({_extent_action} ft): a MODELED "
+                                "stage-buffer extent (OSM waterways × "
+                                f"radius {_fallback['model']['radius_km']} km, "
+                                "exceedance-scaled) substitutes for the "
+                                "map, exposure, and route layers. It is "
+                                "a first-order proximity estimate, NOT "
+                                "observed inundation — verify with "
+                                "imagery or field reports."
+                            ),
+                            field="flood_inundation_extent",
+                        )
+                    )
+                    # Over-breadth disclosure: a blanket buffer over a
+                    # small city over-states the flood (the advisory
+                    # posture keeps it, but the reader must know it is
+                    # an upper bound).
+                    if (
+                        city_area_km2
+                        and city_area_km2 > 0
+                        and gee_flooded_area_km2
+                        and gee_flooded_area_km2 / city_area_km2 > 0.5
+                    ):
+                        validation_issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                code="EXTENT_MODEL_OVERBROAD",
+                                message=(
+                                    f"The modeled stage-buffer covers "
+                                    f"{100.0 * gee_flooded_area_km2 / city_area_km2:.0f}% "
+                                    "of the city area — the buffer "
+                                    "heuristic cannot resolve where within "
+                                    "the corridor water actually reached. "
+                                    "Treat in-city exposure numbers as an "
+                                    "upper bound."
+                                ),
+                                field="flood_inundation_extent",
+                            )
+                        )
+                    self.state.log(
+                        "extent_fallback_modeled",
+                        peak_stage_ft=_extent_stage,
+                        action_stage_ft=_extent_action,
+                        radius_km=_fallback["model"]["radius_km"],
+                        waterway_count=_fallback["model"][
+                            "waterway_count"
+                        ],
+                        area_km2=gee_flooded_area_km2,
+                        clipped_to_city=bool(
+                            _fallback["model"].get("clipped_to_city")
+                        ),
+                    )
+                else:
+                    validation_issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            code="EXTENT_FALLBACK_UNAVAILABLE",
+                            message=(
+                                "Gauge peak indicates flooding but the "
+                                "modeled stage-buffer fallback could not "
+                                "be built"
+                                + (
+                                    f" ({_fallback_error})"
+                                    if _fallback_error
+                                    else " (no usable waterway geometry "
+                                    "in the search radius)"
+                                )
+                                + "; satellite-dependent spatial products "
+                                "were skipped this run."
+                            ),
+                            field="flood_inundation_extent",
+                        )
+                    )
+                    self.state.log(
+                        "extent_fallback_unavailable",
+                        error=_fallback_error,
+                    )
+            elif not gee_extent_usable:
+                self.state.log(
+                    "extent_fallback_skipped",
+                    reason=(
+                        "thresholds_unverified"
+                        if not nwps_gauge.get("threshold_verified")
+                        else "gauge_below_action_stage"
+                    ),
+                    stage_ft=_extent_stage,
+                    action_ft=_extent_action,
+                    corroborators=list(_extent_corroboration),
+                )
+
+            if not gee_extent_usable:
+                candidate_area = _safe_float(gee_flooded_area_km2)
+                if candidate_area is not None and candidate_area > 0:
+                    gis_results["stats"].setdefault(
+                        "unverified_surface_water_area_km2",
+                        round(candidate_area, 4),
+                    )
+                gee_flooded_area_km2 = None
+                flood_union_geom = None
+                gee_geojson = {"type": "FeatureCollection", "features": []}
 
             # Record GIS tool {"error": ...} payloads as validation
             # issues instead of skipping silently.
@@ -2034,7 +2573,8 @@ threshold or validated model is present in the evidence.
                 flood_boundary_path = temp_geojson.name
 
                 gis_results["flood_boundary_path"] = flood_boundary_path
-                gis_results["stats"]["flood_area_km2"] = gee_flooded_area_km2 or 0
+                if gee_flooded_area_km2 is not None:
+                    gis_results["stats"]["flood_area_km2"] = gee_flooded_area_km2
                 
                 self.state.log("gis_gee_geojson", path=flood_boundary_path, area=gee_flooded_area_km2)
                 
@@ -2070,7 +2610,11 @@ threshold or validated model is present in the evidence.
                         "center_lon": location.longitude,
                         "radius_m": self.gis_search_radius_buildings_m,
                         "amenity_types": "building",
-                        "max_results": 500,
+                        # A bounded Overpass result silently undercounts
+                        # affected buildings whenever the cap is reached.
+                        # Request the complete building inventory within
+                        # the configured survey radius instead.
+                        "unlimited_results": True,
                     }, timeout=90.0, max_retries=1)
                     buildings_data = json.loads(buildings_result)
                     if (
@@ -2100,36 +2644,39 @@ threshold or validated model is present in the evidence.
                                     gis_results["stats"]["affected_buildings"] = intersect_data.get("intersected_count", 0)
 
                     # vec_shortest_path: rescue route (the POI layer is
-                    # allowed to fail fast; a small hospital,shelter query
+                    # allowed to fail fast; a bounded hospital,shelter query
                     # usually takes seconds, 45 s leaves rotation room).
-                    # POI search follows the flood footprint when present
-                    # (centroid + bounding radius, capped at 30 km)
-                    # instead of a small fixed radius around the target --
-                    # otherwise POIs cluster at the center of a city-wide
-                    # footprint.
+                    # Facility service-area policy: use the assessment
+                    # target as the service origin.  At the disclosed
+                    # planning speed (default 30 km/h), search the primary
+                    # 30-minute radius (15 km) first; only an empty result
+                    # expands to the 60-minute radius (30 km).  The flood
+                    # footprint does not shrink this service threshold.
                     poi_center_lat = location.latitude
                     poi_center_lon = location.longitude
                     poi_radius_m = self.gis_search_radius_poi_m
-                    if flood_union_geom is not None:
-                        _linked = self.geometry.flood_center_radius(
-                            flood_union_geom
-                        )
-                        if _linked:
-                            poi_center_lat = _linked[0]
-                            poi_center_lon = _linked[1]
-                            poi_radius_m = min(
-                                max(_linked[2], 1000.0), 30000.0
-                            )
-                            gis_results["stats"]["poi_search_scope"] = (
-                                "flood_footprint"
-                            )
-                            gis_results["stats"]["poi_search_center"] = [
-                                round(poi_center_lat, 5),
-                                round(poi_center_lon, 5),
-                            ]
-                            gis_results["stats"]["poi_search_radius_km"] = (
-                                round(poi_radius_m / 1000.0, 2)
-                            )
+                    stats = gis_results["stats"]
+                    stats["poi_search_scope"] = "target_service_area"
+                    stats["poi_search_center"] = [
+                        round(poi_center_lat, 5),
+                        round(poi_center_lon, 5),
+                    ]
+                    stats["facility_planning_speed_kmh"] = round(
+                        self.facility_planning_speed_kmh, 2
+                    )
+                    stats["facility_primary_service_minutes"] = round(
+                        self.facility_primary_service_minutes, 2
+                    )
+                    stats["facility_extended_service_minutes"] = round(
+                        self.facility_extended_service_minutes, 2
+                    )
+                    stats["facility_primary_service_radius_km"] = round(
+                        self.gis_search_radius_poi_m / 1000.0, 2
+                    )
+                    stats["facility_extended_service_radius_km"] = round(
+                        self.gis_search_radius_poi_extended_m / 1000.0, 2
+                    )
+
                     poi_result = await self.mcp.call("poi_search_osm", {
                         "center_lat": poi_center_lat,
                         "center_lon": poi_center_lon,
@@ -2138,27 +2685,53 @@ threshold or validated model is present in the evidence.
                         "max_results": 10,
                     }, timeout=45.0, max_retries=1)
                     poi_data = json.loads(poi_result)
+                    poi_failed = _record_gis_tool_error(
+                        poi_data, "poi_search_osm"
+                    )
+                    features = (
+                        poi_data.get("feature_list", [])
+                        if isinstance(poi_data, dict)
+                        else []
+                    )
+                    search_tier = "primary_30_minute"
+
+                    # A valid but empty primary result triggers the
+                    # extended service area.  Tool failures remain failures
+                    # rather than being disguised as an empty-radius case.
                     if (
-                        not _record_gis_tool_error(
+                        not poi_failed
+                        and not features
+                        and self.gis_search_radius_poi_extended_m
+                        > self.gis_search_radius_poi_m
+                    ):
+                        poi_radius_m = self.gis_search_radius_poi_extended_m
+                        search_tier = "extended_60_minute"
+                        poi_result = await self.mcp.call("poi_search_osm", {
+                            "center_lat": poi_center_lat,
+                            "center_lon": poi_center_lon,
+                            "radius_m": poi_radius_m,
+                            "amenity_types": "hospital,shelter",
+                            "max_results": 10,
+                        }, timeout=45.0, max_retries=1)
+                        poi_data = json.loads(poi_result)
+                        poi_failed = _record_gis_tool_error(
                             poi_data, "poi_search_osm"
                         )
-                        and isinstance(poi_data, dict)
-                    ):
+                        features = (
+                            poi_data.get("feature_list", [])
+                            if isinstance(poi_data, dict)
+                            else []
+                        )
+
+                    stats["poi_search_tier"] = search_tier
+                    stats["poi_search_radius_km"] = round(
+                        poi_radius_m / 1000.0, 2
+                    )
+
+                    if not poi_failed and isinstance(poi_data, dict):
                         poi_path = poi_data.get("output_path")
-                        if poi_path:
+                        if poi_path and features:
                             gis_results["poi_path"] = poi_path
-                            affected_poi_result = await self.mcp.call("vec_intersect", {
-                                "layer1_path": flood_boundary_path,
-                                "layer2_path": poi_path,
-                                "keep_fields": "name,amenity,osm_id",
-                            })
-                            affected_poi_data = json.loads(affected_poi_result)
-                            if (
-                                not _record_gis_tool_error(affected_poi_data, "vec_intersect_facilities")
-                                and isinstance(affected_poi_data, dict)
-                            ):
-                                gis_results["stats"]["affected_facilities"] = affected_poi_data.get("intersected_count", 0)
-                            features = poi_data.get("feature_list", [])
                             if features and isinstance(features, list) and len(features) > 0:
                                 dest = features[0]
                                 if isinstance(dest, dict):
@@ -2211,7 +2784,10 @@ threshold or validated model is present in the evidence.
                                                 route_data.get("flooded_edges_removed")
                                             )
                                             if removed is not None:
-                                                gis_results["stats"]["affected_roads"] = int(removed)
+                                                gis_results["stats"]["affected_roads"] = max(
+                                                    int(gis_results["stats"].get("affected_roads", 0)),
+                                                    int(removed),
+                                                )
 
                     if not gis_results.get("poi_path"):
                         # Disclose search failure / empty results -- a
@@ -2287,13 +2863,6 @@ threshold or validated model is present in the evidence.
                         )
                     )
 
-            # ---- 4. Extent failed the gate (or no GeoJSON): record the area only ----
-            elif gee_flooded_area_km2 is not None:
-                gis_results["stats"]["flood_area_km2"] = gee_flooded_area_km2
-                self.state.log("gis_gee_area_only", area=gee_flooded_area_km2,
-                               note="GEE extent missing, incomplete, or unverified; "
-                                    "GIS analysis limited to the area value")
-
             # Store GIS results in state
             self.state.gis_results = gis_results
             evidence.attributes["gis_stats"] = gis_results["stats"]
@@ -2318,7 +2887,7 @@ threshold or validated model is present in the evidence.
                 )
 
                 # -- Align the denominator scope ------------------------
-                # The SVI search is a 25 km circle around the city center
+                # The SVI search uses the configured radius around the target
                 # and includes out-of-city tracts, while the flood extent
                 # is clipped to the city boundary. An in-city numerator
                 # with an out-of-city denominator systematically dilutes
@@ -2352,7 +2921,7 @@ threshold or validated model is present in the evidence.
                             # search circle disjoint, etc.): keep the
                             # original set and disclose it.
                             social_vulnerability["tract_scope"] = (
-                                "radius_25km_fallback_after_empty_filter"
+                                "search_radius_after_empty_boundary_filter"
                             )
                     else:
                         social_vulnerability["tract_scope"] = "city_boundary"
@@ -2397,15 +2966,13 @@ threshold or validated model is present in the evidence.
                 }
 
             # -- Affected population -----------------------------------
-            # Flood polygons intersected with SVI census tracts: a tract
-            # counts as affected when its centroid falls inside the flood
-            # polygon, and its whole population is included. Documented
-            # approximation (tract population is not uniformly
-            # distributed).
+            # Flood polygons intersected with SVI census tracts.  Without
+            # block-level population, use uniform density within each tract:
+            # tract population × (flooded tract area / tract area).  The
+            # point-containing tract population is never substituted here.
             try:
-                # Without a city boundary (clip not run), build the union
-                # geometry from the raw GEE geojson so the affected
-                # population estimate still works.
+                # Build a union from accepted geometry if the clipped or
+                # modeled union was not retained.
                 if flood_union_geom is None:
                     flood_union_geom = self.geometry.union_features(gee_geojson)
 
@@ -2420,14 +2987,38 @@ threshold or validated model is present in the evidence.
                             social_vulnerability,
                         )
                     )
-                    gis_results["stats"]["affected_population"] = int(affected_pop)
-                    gis_results["stats"]["affected_population_tracts"] = affected_tracts
-                    gis_results["stats"]["affected_population_method"] = pop_method
                     # Per-tract exposure (area-weighted) feeds the equity ledger (VWUN/equity gap)
                     gis_results["tract_exposure"] = self.geometry.tract_exposure(
                         flood_union_geom,
                         social_vulnerability,
                     )
+                    if affected_pop is None:
+                        affected_pop = (
+                            self.geometry.estimate_uniform_density_population(
+                                (
+                                    social_vulnerability.get("profile", {})
+                                    or {}
+                                ).get("total_population"),
+                                gis_results["stats"].get("flood_area_km2"),
+                                city_area_km2,
+                            )
+                        )
+                        if affected_pop is not None:
+                            pop_method = "analysis_area_uniform_density"
+                            # Without tract geometries, there is no defensible
+                            # per-tract allocation for the equity optimizer.
+                            gis_results["tract_exposure"] = []
+                    if affected_pop is not None:
+                        gis_results["stats"]["affected_population"] = int(
+                            affected_pop
+                        )
+                        gis_results["stats"][
+                            "affected_population_method"
+                        ] = pop_method
+                        if pop_method == "areal_weighted":
+                            gis_results["stats"][
+                                "affected_population_tracts"
+                            ] = affected_tracts
                     # Method bracket: the area-weighted and centroid
                     # whole-tract estimates bound the point estimate,
                     # making the uniform-distribution uncertainty
@@ -2435,13 +3026,17 @@ threshold or validated model is present in the evidence.
                     _bracket = self.geometry.affected_population_bracket(
                         gis_results["tract_exposure"]
                     )
-                    if _bracket is not None:
+                    if _bracket is not None and pop_method == "areal_weighted":
                         gis_results["stats"][
                             "affected_population_interval"
                         ] = _bracket["interval"]
                     self.state.log(
                         "affected_population_estimated",
-                        affected_population=int(affected_pop),
+                        affected_population=(
+                            int(affected_pop)
+                            if affected_pop is not None
+                            else None
+                        ),
                         affected_tracts=affected_tracts,
                         method=pop_method,
                     )
@@ -2450,6 +3045,31 @@ threshold or validated model is present in the evidence.
                     "affected_population_estimation_failed",
                     error=str(pop_err),
                 )
+
+            if flood_union_geom is not None:
+                for item in fused_evidence.get("observations", []):
+                    if not isinstance(item, dict):
+                        continue
+                    raw = item.get("raw") or {}
+                    if not isinstance(raw, dict) or raw.get("source_type") != "infrastructure":
+                        continue
+                    facilities = (raw.get("metadata") or {}).get("facilities")
+                    if not isinstance(facilities, list):
+                        continue
+                    try:
+                        affected, locatable = (
+                            self.geometry.count_facilities_in_extent(
+                                flood_union_geom, facilities
+                            )
+                        )
+                        gis_results["stats"]["affected_facilities"] = affected
+                        gis_results["stats"]["facility_inventory_count"] = locatable
+                    except Exception as facility_err:
+                        self.state.log(
+                            "affected_facilities_estimation_failed",
+                            error=str(facility_err),
+                        )
+                    break
 
             # -- HITL parameter confirmation checkpoint -----------------
             # Before decision-critical steps (resource optimization),
@@ -2722,10 +3342,20 @@ threshold or validated model is present in the evidence.
                         and social_vulnerability.get("status") == "ok"
                         else None
                     )
+                    # Capacity-constrained allocation demand: the
+                    # area-weighted exposed population and SVI for each
+                    # tract, with a spatial centroid for assignment.
+                    _demand_records = build_demand_records(
+                        gis_results.get("tract_exposure", []),
+                        _svi_tracts or [],
+                        centroid_of=self.allocation._tract_centroid,
+                    )
                     plans = self.allocation.generate_plans(
                         resources=resources,
                         fused_evidence=fused_evidence,
                         svi_tracts=_svi_tracts,
+                        demand_records=_demand_records,
+                        vulnerability_weight=self.vulnerability_weight,
                     )
 
                     # -- SVI influences Pareto weights: when SVI is
@@ -2844,8 +3474,9 @@ threshold or validated model is present in the evidence.
                         # -- Equity ledger --------------------------------
                         # Per-tract demand_impacts: exposed_population and
                         # hazard_exposure come from area-weighted flood
-                        # intersections with census tracts; coverage comes
-                        # from each plan's facility coverage radius. VWUN /
+                        # intersections with census tracts; coverage is the
+                        # fraction of exposed people assigned under capacity.
+                        # VWUN /
                         # equity_gap / covered-community lists are computed
                         # per plan over the whole Pareto frontier (the
                         # efficiency-equity trade-off curve), using the
@@ -2854,49 +3485,11 @@ threshold or validated model is present in the evidence.
                         recommended = (
                             optimization.get("recommended_plan") or {}
                         )
-
-                        _cover_radius_km = (
-                            self.allocation.vulnerability_coverage_radius_km
-                        )
-                        _svi_tracts_for_lookup = (
-                            social_vulnerability.get("tracts") or []
-                            if isinstance(social_vulnerability, dict)
-                            else []
-                        )
-
-                        # Demand records (with centroids) are built once
-                        # and reused for any plan x coverage radius --
-                        # the basis of the radius sensitivity sweep.
-                        _demand_records = build_demand_records(
-                            gis_results.get("tract_exposure", []),
-                            _svi_tracts_for_lookup,
-                            centroid_of=self.allocation._tract_centroid,
-                        )
-
-                        def _plan_alloc_points(plan: dict[str, Any]):
-                            pts = [
-                                (
-                                    _safe_float(a.get("lat")),
-                                    _safe_float(a.get("lon")),
-                                )
-                                for a in (plan.get("allocations") or [])
-                            ]
-                            return [
-                                pt for pt in pts
-                                if pt[0] is not None and pt[1] is not None
-                            ]
-
-                        def _plan_demand_impacts(
-                            plan: dict[str, Any],
-                            radius_km: float | None = None,
-                        ):
-                            return demand_impacts_for_plan(
-                                _demand_records,
-                                _plan_alloc_points(plan),
-                                radius_km
-                                if radius_km is not None
-                                else _cover_radius_km,
+                        def _plan_demand_impacts(plan: dict[str, Any]):
+                            assigned = (plan.get("supply_demand") or {}).get(
+                                "demand_impacts"
                             )
+                            return assigned if isinstance(assigned, list) else []
 
                         # Equity curve over the full frontier: cost / VWUN
                         # / equity gap / prioritized communities per
@@ -2914,7 +3507,12 @@ threshold or validated model is present in the evidence.
                                         impacts, self.vulnerability_weight
                                     )
                                 )
-                                gap_p, _ = compute_equity_gap_or_none(
+                                normalized_vwun_p = (
+                                    compute_normalized_vulnerability_weighted_unmet_need(
+                                        impacts, self.vulnerability_weight
+                                    )
+                                )
+                                gap_p, gap_note_p = compute_equity_gap_or_none(
                                     impacts, self.equity_threshold
                                 )
                             except SocialGoodError:
@@ -2923,6 +3521,7 @@ threshold or validated model is present in the evidence.
                                 d["tract_id"]
                                 for d in impacts if d["coverage"] >= 1.0
                             ]
+                            plan_supply = plan.get("supply_demand") or {}
                             equity_curve.append(
                                 {
                                     "plan_id": plan.get("plan_id"),
@@ -2938,11 +3537,15 @@ threshold or validated model is present in the evidence.
                                     "vulnerability_weighted_unmet_need": round(
                                         vwun_p, 2
                                     ),
+                                    "normalized_vulnerability_weighted_unmet_need": round(
+                                        normalized_vwun_p, 6
+                                    ),
                                     "equity_gap": (
                                         round(gap_p, 6)
                                         if gap_p is not None
                                         else None
                                     ),
+                                    "equity_gap_note": gap_note_p,
                                     "covered_tract_ids": covered_ids,
                                     "covered_high_svi_tract_ids": [
                                         d["tract_id"]
@@ -2950,9 +3553,30 @@ threshold or validated model is present in the evidence.
                                         if d["coverage"] >= 1.0
                                         and d["svi"] >= self.equity_threshold
                                     ],
+                                    "served_people": (
+                                        plan_supply.get("served_people")
+                                    ),
+                                    "unmet_people": (
+                                        plan_supply.get("unmet_people")
+                                    ),
+                                    "travel_distance_p95_km": plan_supply.get(
+                                        "travel_distance_p95_km"
+                                    ),
+                                    "transfer_time_estimate_range_minutes": (
+                                        plan_supply.get(
+                                            "transfer_time_estimate_range_minutes"
+                                        )
+                                    ),
+                                    "planning_gaps": (
+                                        plan_supply.get("planning_gaps") or []
+                                    ),
                                 }
                             )
                         optimization["frontier_equity_curve"] = equity_curve
+                        optimization["plan_scenarios"] = build_plan_scenarios(
+                            equity_curve,
+                            recommended.get("plan_id"),
+                        )
 
                         # Main ledger for the recommended plan (same computation)
                         demand_impacts = _plan_demand_impacts(recommended)
@@ -2964,65 +3588,31 @@ threshold or validated model is present in the evidence.
                                         self.vulnerability_weight,
                                     )
                                 )
+                                normalized_vwun = (
+                                    compute_normalized_vulnerability_weighted_unmet_need(
+                                        demand_impacts,
+                                        self.vulnerability_weight,
+                                    )
+                                )
                                 equity_gap, equity_gap_note = (
                                     compute_equity_gap_or_none(
                                         demand_impacts,
                                         self.equity_threshold,
                                     )
                                 )
-
-                                # -- Coverage-radius sensitivity ---------
-                                # Coverage is a binary "centroid within R km
-                                # of a facility" test, and R is the most
-                                # fragile assumption of the equity metrics:
-                                # recompute VWUN / equity gap per sweep
-                                # radius for the recommended plan. This is
-                                # an interval, not a new recommendation.
-                                radius_sensitivity = []
-                                for _r in self.coverage_radius_sweep:
-                                    _impacts_r = _plan_demand_impacts(
-                                        recommended, radius_km=_r
+                                concentration_index, concentration_note = (
+                                    compute_coverage_concentration_index_or_none(
+                                        demand_impacts
                                     )
-                                    if not _impacts_r:
-                                        continue
-                                    try:
-                                        radius_sensitivity.append(
-                                            {
-                                                "radius_km": _r,
-                                                "vulnerability_weighted_unmet_need": round(
-                                                    compute_vulnerability_weighted_unmet_need(
-                                                        _impacts_r,
-                                                        self.vulnerability_weight,
-                                                    ),
-                                                    2,
-                                                ),
-                                                "equity_gap": (
-                                                    lambda _g: round(_g, 6)
-                                                    if _g is not None
-                                                    else None
-                                                )(
-                                                    compute_equity_gap_or_none(
-                                                        _impacts_r,
-                                                        self.equity_threshold,
-                                                    )[0]
-                                                ),
-                                                "covered_tract_count": sum(
-                                                    1
-                                                    for d in _impacts_r
-                                                    if d["coverage"] >= 1.0
-                                                ),
-                                                "is_operating_radius": (
-                                                    _r == _cover_radius_km
-                                                ),
-                                            }
-                                        )
-                                    except SocialGoodError:
-                                        continue
+                                )
 
                                 self.state.log(
                                     "social_good_metrics_computed",
                                     vulnerability_weighted_unmet_need=round(
                                         vwun, 2
+                                    ),
+                                    normalized_vulnerability_weighted_unmet_need=round(
+                                        normalized_vwun, 6
                                     ),
                                     equity_gap=(
                                         round(equity_gap, 6)
@@ -3030,6 +3620,14 @@ threshold or validated model is present in the evidence.
                                         else None
                                     ),
                                     equity_gap_note=equity_gap_note,
+                                    coverage_concentration_index=(
+                                        round(concentration_index, 6)
+                                        if concentration_index is not None
+                                        else None
+                                    ),
+                                    coverage_concentration_index_note=(
+                                        concentration_note
+                                    ),
                                     equity_threshold=self.equity_threshold,
                                     vulnerability_weight=(
                                         self.vulnerability_weight
@@ -3041,19 +3639,25 @@ threshold or validated model is present in the evidence.
                                         if d["coverage"] >= 1.0
                                     ),
                                     frontier_plan_count=len(equity_curve),
-                                    radius_sensitivity=radius_sensitivity,
                                     interpretation=(
                                         "VWUN: vulnerability-weighted unmet "
                                         "need of the RECOMMENDED plan (lower "
                                         "is better). equity_gap: mean coverage "
                                         "of high-SVI tracts minus low-SVI "
                                         "tracts (negative = the most "
-                                        "vulnerable are underserved)."
+                                        "vulnerable are underserved). "
+                                        "coverage_concentration_index uses "
+                                        "continuous population-weighted SVI "
+                                        "ranks (positive = coverage favors "
+                                        "higher-SVI tracts)."
                                     ),
                                 )
                                 optimization["equity_ledger"] = {
                                     "vulnerability_weighted_unmet_need": round(
                                         vwun, 2
+                                    ),
+                                    "normalized_vulnerability_weighted_unmet_need": round(
+                                        normalized_vwun, 6
                                     ),
                                     "equity_gap": (
                                         round(equity_gap, 6)
@@ -3061,42 +3665,70 @@ threshold or validated model is present in the evidence.
                                         else None
                                     ),
                                     "equity_gap_note": equity_gap_note,
+                                    "coverage_concentration_index": (
+                                        round(concentration_index, 6)
+                                        if concentration_index is not None
+                                        else None
+                                    ),
+                                    "coverage_concentration_index_note": (
+                                        concentration_note
+                                    ),
+                                    "metric_definitions": {
+                                        "vulnerability_weighted_unmet_need": (
+                                            "sum(exposed_population * "
+                                            "(1 - coverage) * "
+                                            "(1 + vulnerability_weight * svi)); "
+                                            "lower is better"
+                                        ),
+                                        "normalized_vulnerability_weighted_unmet_need": (
+                                            "VWUN divided by weighted demand at zero "
+                                            "coverage; 0 means fully served and 1 "
+                                            "means no demand served"
+                                        ),
+                                        "equity_gap": (
+                                            "unweighted mean tract coverage "
+                                            "for svi >= equity_threshold minus "
+                                            "unweighted mean tract coverage for "
+                                            "svi < equity_threshold; negative "
+                                            "means higher-SVI tracts receive less"
+                                        ),
+                                        "coverage_concentration_index": (
+                                            "population-weighted concentration "
+                                            "index of coverage over fractional "
+                                            "SVI rank; positive means coverage "
+                                            "is concentrated among higher-SVI "
+                                            "tracts"
+                                        ),
+                                    },
                                     "equity_threshold": self.equity_threshold,
                                     "vulnerability_weight": (
                                         self.vulnerability_weight
                                     ),
-                                    "coverage_radius_km": _cover_radius_km,
-                                    "coverage_radius_sensitivity": (
-                                        radius_sensitivity
-                                    ),
                                     "demand_tract_count": len(demand_impacts),
                                     "demand_impacts": demand_impacts,
                                     "frontier_equity_curve": equity_curve,
-                                    # Full context for frontend lambda /
-                                    # radius recomputation: demand records,
-                                    # recommended-plan allocation points,
-                                    # frontier plans with objectives, and
-                                    # the objective directions / base
-                                    # weights / SVI used for scoring --
-                                    # enough to preview whether the
-                                    # recommendation flips under a different
-                                    # lambda or radius, without rerunning
-                                    # the pipeline.
+                                    "supply_demand": recommended.get(
+                                        "supply_demand"
+                                    ),
+                                    # Context for frontend lambda recomputation:
+                                    # per-plan assignment impacts and objective
+                                    # weights, with no geometric radius sweep.
                                     "sensitivity_context": {
-                                        "demand_records": _demand_records,
-                                        "coverage_radius_km": _cover_radius_km,
-                                        "recommended_allocation_points": (
-                                            _plan_alloc_points(recommended)
-                                        ),
                                         "recommended_plan_id": recommended.get(
                                             "plan_id"
                                         ),
+                                        "frontier_plan_impacts": {
+                                            str(plan.get("plan_id")): (
+                                                _plan_demand_impacts(plan)
+                                            )
+                                            for plan in optimization.get(
+                                                "pareto_frontier", []
+                                            )
+                                            if plan.get("plan_id")
+                                        },
                                         "frontier_plans": [
                                             {
                                                 "plan_id": plan.get("plan_id"),
-                                                "allocation_points": (
-                                                    _plan_alloc_points(plan)
-                                                ),
                                                 "objectives": dict(
                                                     plan.get("objectives") or {}
                                                 ),
@@ -3113,6 +3745,9 @@ threshold or validated model is present in the evidence.
                                             for o in _active_objectives
                                         ],
                                         "weights_used": dict(effective_weights),
+                                        "base_objective_weights": dict(
+                                            self.allocation_weights
+                                        ),
                                         "vulnerability_weight": (
                                             self.vulnerability_weight
                                         ),
@@ -3156,10 +3791,25 @@ threshold or validated model is present in the evidence.
                 optimization = {"status": "not_configured"}
             
 
-            summary_parts = [
-                f"USGS station {observation['station_id']} reported "
-                f"{observation['water_level']} ft at {observation['observation_time']}."
-            ]
+            _summary_ws = observation.get("window_summary")
+            if (
+                isinstance(_summary_ws, dict)
+                and _summary_ws.get("peak_stage_ft") is not None
+            ):
+                summary_parts = [
+                    f"USGS station {observation['station_id']} peaked at "
+                    f"{_summary_ws['peak_stage_ft']} ft "
+                    f"({_summary_ws.get('peak_time')}) inside the event "
+                    f"window {_summary_ws.get('start')}..{_summary_ws.get('end')}; "
+                    f"window-end stage {_summary_ws.get('end_stage_ft')} ft "
+                    f"({_summary_ws.get('value_count')} samples)."
+                ]
+            else:
+                summary_parts = [
+                    f"USGS station {observation['station_id']} reported "
+                    f"{observation['water_level']} ft at "
+                    f"{observation['observation_time']}."
+                ]
 
             if fused_evidence.get("status") == "fused":
                 summary_parts.append(
@@ -3194,7 +3844,8 @@ threshold or validated model is present in the evidence.
                     + (
                         "; current-only sources ("
                         + ", ".join(filter(None, _skipped_names))
-                        + ") were excluded — no historical archive endpoint."
+                        + ") were excluded because the configured connectors "
+                        "do not query the event window."
                         if _skipped_names
                         else "; no current-only sources were configured."
                     )
@@ -3211,12 +3862,45 @@ threshold or validated model is present in the evidence.
                     "NWPS observed/forecast stageflow evidence is unavailable."
                 )
 
-            next_actions.append("Add observed precipitation and precipitation forecast evidence.")
+            if not self.historical_mode:
+                observed_precipitation = any(
+                    "precipitation" in str(name).lower()
+                    and "probability" not in str(name).lower()
+                    and "forecast" not in str(name).lower()
+                    for name in (
+                        fused_evidence.get("fused_measurements") or {}
+                    )
+                ) or any(
+                    item.get("evidence_type") == "status_observation"
+                    and item.get("variable") == "precipitation"
+                    for item in fused_evidence.get("observations", [])
+                    if isinstance(item, dict)
+                )
+                has_forecast = any(
+                    _safe_float(period.get("probability_of_precipitation"))
+                    is not None
+                    for item in fused_evidence.get("forecasts", [])
+                    if isinstance(item, dict)
+                    for period in (item.get("forecasts") or [])
+                    if isinstance(period, dict)
+                )
+                if not observed_precipitation:
+                    next_actions.append("Obtain observed precipitation evidence.")
+                if not has_forecast:
+                    next_actions.append("Obtain precipitation forecast evidence.")
 
-            # State explicitly when there is no flood extent (so a missing
-            # map does not read as a failure): distinguish "no inundation
-            # detected" from "data unavailable" and say what was skipped.
-            if gee_flooded_area_km2 is None:
+            # State explicitly which kind of flood extent (if any) backs
+            # the spatial products: satellite-observed, modeled fallback,
+            # or none (so a missing map does not read as "no flooding").
+            if extent_provenance == "modeled_stage_buffer":
+                next_actions.append(
+                    "Satellite imagery was absent/misaligned/uncorroborated "
+                    "for this event; the mapped extent is a MODELED "
+                    "stage-buffer approximation from the verified gauge "
+                    "peak and OSM waterways. Verify inundation with "
+                    "imagery or field reports before dispatch."
+                )
+            elif gee_flooded_area_km2 is None:
                 _rejected_sat = [
                     r.get("source", "satellite")
                     for r in (fused_evidence.get("rejected_sources", [])
@@ -3224,18 +3908,24 @@ threshold or validated model is present in the evidence.
                     if r.get("source_type") == "satellite_sar"
                 ]
                 next_actions.append(
-                    "No satellite flood extent was "
+                    "No flood extent was produced: the satellite layer "
                     + (
-                        "retrieved (SAR source unavailable)"
+                        "was unavailable (SAR source failed)"
                         if _rejected_sat
-                        else "detected for this event"
+                        else "found nothing usable for this event"
                     )
-                    + "; inundation-dependent analysis (flood map, areal "
-                    "population exposure, route impact) was skipped. "
-                    "CDRI hazard is based on water-level ratio only."
+                    + " and the modeled stage-buffer fallback did not "
+                    "trigger (gauge peak below action stage or thresholds "
+                    "unverified). Inundation-dependent analysis (flood "
+                    "map, areal population exposure, route impact) was "
+                    "skipped. CDRI hazard is based on water-level ratio "
+                    "only."
                 )
             else:
-                next_actions.append("Add inundation/extent data for city-wide impact assessment.")
+                next_actions.append(
+                    "Validate the satellite-derived inundation extent against "
+                    "field reports before operational dispatch."
+                )
 
             if isinstance(optimization, dict) and optimization.get("status") == "optimized":
                 next_actions.append(

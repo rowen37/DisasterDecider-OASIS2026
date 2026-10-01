@@ -28,6 +28,7 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 from overpass_client import OverpassError, post_overpass_async
+from osm_labels import load_label_overrides, osm_display_label
 
 mcp = FastMCP("Resource Manager")
 
@@ -179,6 +180,7 @@ async def _fetch_osm_facilities(
     }
 
     facilities = []
+    label_overrides = load_label_overrides()
     for el in data.get("elements", []):
         tags = el.get("tags", {}) or {}
         kind = kind_by_tag.get(tags.get("amenity", ""))
@@ -191,17 +193,30 @@ async def _fetch_osm_facilities(
         lon = el.get("lon") or center.get("lon")
         if lat is None or lon is None:
             continue
+        label = osm_display_label(
+            tags,
+            feature_type=kind,
+            osm_type=str(el.get("type") or "element"),
+            osm_id=el.get("id"),
+            lat=float(lat),
+            lon=float(lon),
+            overrides=label_overrides,
+        )
         facilities.append(
             {
                 "kind": kind,
-                "name": tags.get("name") or tags.get("operator") or f"{kind} (OSM {el.get('id')})",
+                "name": label["label"],
+                "address": label["address"],
+                "label_source": label["label_source"],
                 "lat": lat,
                 "lon": lon,
                 "distance_km": round(
                     _haversine_km(latitude, longitude, lat, lon), 2
                 ),
                 "tags": {
-                    k: tags[k] for k in ("beds", "capacity", "ambulances", "phone") if k in tags
+                    k: tags[k]
+                    for k in ("beds", "capacity", "ambulances", "phone")
+                    if k in tags
                 },
             }
         )
@@ -259,6 +274,8 @@ def _build_plans(
                 # vulnerability_coverage (population-weighted SVI coverage).
                 "lat": p.get("lat"),
                 "lon": p.get("lon"),
+                "address": p.get("address"),
+                "label_source": p.get("label_source"),
             }
             for p in picks
         ]

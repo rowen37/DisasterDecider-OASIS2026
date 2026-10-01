@@ -91,15 +91,20 @@ SOURCE_AUTHORITY = {
         "tier": "open_geospatial",
         "score": 0.8,
     },
-    # Authoritative space program + derived products (Sentinel-1 SAR
-    # change detection computed by this system)
+    # Authoritative space program, but the flood-extent product is THIS
+    # SYSTEM's own change-detection computation on top of it: revisit
+    # latency (6-12 days) makes the acquisition timing uncertain
+    # relative to a flood peak, and single-pair change detection has
+    # known false positives (wet soil / vegetation / geometry). Tiered
+    # below operational gauge/hydrology sources; it refines the
+    # spatial picture, it does not establish the hazard.
     "SENTINEL": {
-        "tier": "authoritative_program_derived",
-        "score": 0.8,
+        "tier": "authoritative_platform_derived_product",
+        "score": 0.6,
     },
     "COPERNICUS": {
-        "tier": "authoritative_program_derived",
-        "score": 0.8,
+        "tier": "authoritative_platform_derived_product",
+        "score": 0.6,
     },
 }
 

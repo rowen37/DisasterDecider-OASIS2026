@@ -24,6 +24,7 @@ from app.experiment import ExperimentLogger  # noqa: E402
 from app.hitl import AdaptiveHITL  # noqa: E402
 from app.models import RunState  # noqa: E402
 from app.naive_baseline import NaiveBaseline  # noqa: E402
+from app.threshold_dashboard_baseline import ThresholdDashboardBaseline  # noqa: E402
 from app.skills import FloodSkill  # noqa: E402
 from app.verification import Verifier  # noqa: E402
 
@@ -209,13 +210,21 @@ async def _run_naive(scenario: str) -> dict:
     )
 
 
+async def _run_threshold_dashboard(scenario: str) -> dict:
+    mcp = FakeMCP()
+    _apply_fault(mcp, scenario)
+    _target, station, _ = _scenario_args(scenario)
+    return await ThresholdDashboardBaseline().run(mcp, station_id=station)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", SCENARIOS)
 async def test_baseline_comparison_row(tmp_path, monkeypatch, scenario):
     """One assertion block per scenario row of the comparison table."""
     naive = await _run_naive(scenario)
+    dashboard = await _run_threshold_dashboard(scenario)
     ours = await _run_ours(monkeypatch, tmp_path, scenario)
-    _print_row(scenario, naive, ours)
+    _print_row(scenario, naive, ours, dashboard)
 
     assert ours["completed"], f"[{scenario}] reference pipeline failed"
     assert naive["status"] == "completed"
@@ -227,6 +236,8 @@ async def test_baseline_comparison_row(tmp_path, monkeypatch, scenario):
         # shows up under faults.
         assert abs(naive["cdri_percent"] - ours["cdri_percent"]) <= 1.5
         assert naive["band"] is None and ours["band"] is not None
+        assert dashboard["status"] == "ok"
+        assert dashboard["hydrologic_category"] == "action"
     elif scenario == "S1-metadata-503":
         assert "STATION_METADATA_UNAVAILABLE" in ours["issue_codes"]
         # naive keeps recommending allocation from unverified geography
@@ -236,6 +247,8 @@ async def test_baseline_comparison_row(tmp_path, monkeypatch, scenario):
         assert "degraded" not in naive["cdri_label"]
         assert "degraded" in (ours["cdri_label"] or "")
         assert "NWPS_GAUGE_UNAVAILABLE" in ours["issue_codes"]
+        assert dashboard["status"] == "unavailable"
+        assert "authoritative_flood_categories" in dashboard["data_gaps"]
     elif scenario == "S3-far-station":
         # naive recommends allocation ~3000 km from the gauge
         assert naive["allocation_emitted"] is True
@@ -245,9 +258,13 @@ async def test_baseline_comparison_row(tmp_path, monkeypatch, scenario):
         # naive: dangerously optimistic zeros
         assert naive["exposed_population"] == 0
         assert naive["vwun_recommended"] == 0
-        # ours: degradation disclosed, unmet need NOT collapsed to zero
-        assert "flooded_area_km2" in ours["data_gaps"]
-        assert "degraded" in (ours["cdri_label"] or "")
+        # ours (policy 2026-09-26): satellite found nothing but the
+        # verified gauge crossed action stage -> a MODELED stage-buffer
+        # extent substitutes, so exposed population and unmet need are
+        # NOT collapsed to zero and the substitution is disclosed.
+        assert "EXTENT_FALLBACK_MODELED" in ours["issue_codes"]
+        assert "flooded_area_km2" not in ours["data_gaps"]
+        assert (ours["exposed"] or 0) > 0
     elif scenario == "S5-stale-sar":
         # naive silently consumes the misaligned scene
         assert naive["exposed_population"] > 0
@@ -255,7 +272,12 @@ async def test_baseline_comparison_row(tmp_path, monkeypatch, scenario):
         assert "SAR_EXTENT_STALE" in ours["issue_codes"]
 
 
-def _print_row(scenario: str, naive: dict, ours: dict) -> None:
+def _print_row(
+    scenario: str,
+    naive: dict,
+    ours: dict,
+    dashboard: dict | None = None,
+) -> None:
     def f(x, nd=2):
         return "-" if x is None else round(x, nd)
 
@@ -271,3 +293,11 @@ def _print_row(scenario: str, naive: dict, ours: dict) -> None:
           f"interval {ours['exposed_interval']} | VWUN {f(ours['vwun'], 1)} | "
           f"plan {ours['recommended']} | opt={ours['opt_status']} | "
           f"issues {ours['issue_codes']}")
+    if dashboard is not None:
+        print(
+            "  gauge dashboard: "
+            f"status={dashboard.get('status')} | category="
+            f"{dashboard.get('hydrologic_category')} | gaps="
+            f"{dashboard.get('data_gaps', [])} | spatial/equity/routing="
+            "out of scope"
+        )

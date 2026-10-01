@@ -7,6 +7,50 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("Flood Alert")
 
+# USGS missing-value sentinels: must not win a max() comparison or
+# leak into the payload.
+MISSING_SENTINELS = {"", "-999999", "-99999", "NaN"}
+
+
+def select_stage_observation(
+    values: list,
+    windowed: bool,
+) -> tuple | None:
+    """Choose the primary stage value and build the hydrograph summary.
+
+    windowed=False: primary = latest instantaneous value (realtime).
+    windowed=True: primary = the window PEAK -- an event's severity IS
+    its peak stage (NWPS flood categories are defined on instantaneous
+    stage), and a flash flood that recedes inside the window would be
+    acquitted by its window-end snapshot (Lodi NJ 2026-09-13 case).
+
+    Returns (primary_value_dict, window_summary | None, semantics) or
+    None when every value is a missing sentinel.
+    """
+    clean = [
+        v for v in values
+        if str(v.get("value", "")).strip() not in MISSING_SENTINELS
+    ]
+    if not clean:
+        return None
+
+    latest = clean[-1]
+    if not windowed:
+        return latest, None, "latest_instantaneous"
+
+    peak = max(clean, key=lambda v: float(v["value"]))
+    window_summary = {
+        "value_count": len(clean),
+        "peak_stage_ft": float(peak["value"]),
+        "peak_time": peak.get("dateTime"),
+        "end_stage_ft": float(latest["value"]),
+        "end_time": latest.get("dateTime"),
+        "min_stage_ft": float(
+            min(clean, key=lambda v: float(v["value"]))["value"]
+        ),
+    }
+    return peak, window_summary, "window_peak"
+
 @mcp.tool()
 async def get_flood_observation(
     station_id: str,
@@ -18,9 +62,16 @@ async def get_flood_observation(
 
     Without start_dt/end_dt: return the latest instantaneous value
     (live mode). With start_dt/end_dt (ISO 8601 or YYYY-MM-DD):
-    return the observation closest to end_dt within the window
-    (historical replay — natively supported by the USGS IV API via
-    the startDT/endDT query parameters).
+    return the PEAK observation within the window (historical replay)
+    plus a window_summary describing the full hydrograph (peak / end
+    / minimum stage with timestamps).
+
+    Peak semantics rationale: flood severity of a past event IS its
+    peak stage -- NWPS flood categories are defined on instantaneous
+    stage, and a flash flood that rises and recedes inside one window
+    is misrepresented by the window-end value (it reads "in bank"
+    after the event has already happened). The end value is preserved
+    in window_summary.end_stage_ft so trend analysis stays possible.
     """
 
     url = os.environ.get("USGS_WATER_API_URL")
@@ -86,7 +137,21 @@ async def get_flood_observation(
             ["value"]
         )
 
-        latest = values[-1]
+        selection = select_stage_observation(
+            values,
+            windowed=bool(start_dt and end_dt),
+        )
+        if selection is None:
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    "USGS returned no usable stage values for this "
+                    "window (all missing/sentinel)."
+                ),
+                "station_id": station_id,
+            }, ensure_ascii=False)
+
+        primary, window_summary, observation_semantics = selection
 
         # ── Extract coordinates and station name from the response ──
         source_info = time_series.get("sourceInfo", {})
@@ -115,9 +180,19 @@ async def get_flood_observation(
                 ),
                 "observation": {
                     "station_id":       station_id,
-                    "water_level":      float(latest["value"]),
+                    "water_level":      float(primary["value"]),
                     "unit":             os.getenv("USGS_STAGE_UNIT", "ft"),
-                    "observation_time": latest["dateTime"],
+                    "observation_time": primary["dateTime"],
+                    "observation_semantics": observation_semantics,
+                    "window_summary": (
+                        {
+                            "start": start_dt,
+                            "end": end_dt,
+                            **window_summary,
+                        }
+                        if window_summary is not None
+                        else None
+                    ),
                     "source":           "USGS",
                     "station_name":     station_name,
                     "latitude":         obs_latitude,

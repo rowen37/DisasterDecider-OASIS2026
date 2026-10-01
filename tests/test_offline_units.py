@@ -18,6 +18,7 @@ from app.models import (                               # noqa: E402
     Evidence,
     RunState,
     SkillResult,
+    SpatialObject,
 )
 from app.engine.flood_fusion_engine import (        # noqa: E402
     normalize_fusion_observation,
@@ -51,7 +52,8 @@ def _make_result() -> SkillResult:
                 "observations": [
                     {
                         "raw": {
-                            "source_type": "population_exposure",
+                            "source_type": "population_context",
+                            "population_role": "containing_tract_population",
                             "population": {"total": 8500},
                         },
                     },
@@ -150,10 +152,16 @@ def test_extract_structured_data():
     assert structured["forecast_periods"][0]["probability_of_precipitation"] == 34
     assert structured["population_total"] == 1371035
     assert structured["population_affected"] == 12693
-    # Population exposure comes only from the structured fusion path
-    # (Census tract population) and must never be overridden by the
-    # "325 census tract(s)" text in the SVI evidence.
-    assert structured["population_exposure"] == 8500
+    # The point-containing Census tract population is context only and must
+    # never be confused with the flood-intersection affected population or
+    # overridden by the "325 census tract(s)" text in the SVI evidence.
+    assert structured["population_context"] == 8500
+    assert structured["hydrologic_category"] == "below_action"
+    assert structured["next_flood_threshold"] == {
+        "category": "action",
+        "stage_ft": 7.0,
+        "margin_ft": 5.79,
+    }
     ic = structured["infrastructure_counts"]
     assert ic["affected_buildings"] == 246
     assert ic["affected_facilities"] == 2
@@ -165,6 +173,141 @@ def test_extract_structured_data():
     assert di["cdri_risk_label"] == "Low"
     assert structured["osm_facilities"][0]["name"] == "HCA Houston"
     print("PASS extract_structured_data")
+
+
+def test_population_context_never_backfills_affected_population():
+    evidence = Evidence(
+        evidence_id="population_context_only",
+        source="test",
+        observation="Containing-tract population context.",
+        attributes={
+            "multi_source_fusion": {
+                "observations": [
+                    {
+                        "raw": {
+                            "source_type": "population_context",
+                            "population_role": "containing_tract_population",
+                            "population": {"total": 4638},
+                        }
+                    }
+                ],
+                "fused_values": {
+                    "containing_tract_population": {
+                        "value": 4638,
+                        "unit": "people",
+                    }
+                },
+            }
+        },
+    )
+    structured = _extract_structured_data(
+        SkillResult(status="completed", summary="test", evidence=[evidence]),
+        RunState(run_id="population-context"),
+    )
+
+    assert structured["population_context"] == 4638
+    assert structured["population_affected"] is None
+
+
+def test_extent_metadata_requires_an_actual_extent():
+    no_extent = _extract_structured_data(
+        SkillResult(status="completed", summary="test"),
+        RunState(run_id="no-extent"),
+    )
+    assert no_extent["flood_extent_status"] == "not_detected"
+    assert no_extent["extent_provenance"] is None
+    assert no_extent["extent_model"] is None
+    assert no_extent["extent_confidence"] is None
+    assert no_extent["extent_timestamp"] is None
+
+    rejected = _extract_structured_data(
+        SkillResult(
+            status="completed",
+            summary="test",
+            spatial_objects=[SpatialObject(
+                object_id="flood_inundation_extent",
+                object_type="flood_extent",
+                geometry={"type": "FeatureCollection", "features": []},
+                attributes={"flooded_area_km2": 30.3261},
+            )],
+            evidence=[Evidence(
+                evidence_id="area_only",
+                source="test",
+                observation="area only",
+                attributes={"gis_stats": {"flood_area_km2": 30.3261}},
+            )],
+        ),
+        RunState(run_id="rejected-extent"),
+    )
+    assert rejected["flood_extent_status"] == "not_detected"
+    assert rejected["flooded_area_km2"] is None
+
+    modeled = SpatialObject(
+        object_id="flood_inundation_extent",
+        object_type="flood_extent",
+        geometry={
+            "type": "FeatureCollection",
+            "features": [{"type": "Feature", "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]],
+            }}],
+        },
+        timestamp="2026-09-13T12:00:00+00:00",
+        attributes={
+            "extent_provenance": "modeled_stage_buffer",
+            "model": {"method": "stage_buffer"},
+        },
+    )
+    with_extent = _extract_structured_data(
+        SkillResult(
+            status="completed",
+            summary="test",
+            spatial_objects=[modeled],
+        ),
+        RunState(run_id="modeled-extent"),
+    )
+    assert with_extent["extent_provenance"] == "modeled_stage_buffer"
+    assert with_extent["extent_model"] == {"method": "stage_buffer"}
+    assert with_extent["extent_confidence"] is None
+    assert with_extent["extent_timestamp"] == "2026-09-13T12:00:00+00:00"
+    assert with_extent["flood_extent_status"] == "detected"
+    assert with_extent["flood_extent"] == "Detected"
+
+
+def test_extracts_capacity_assignment_without_dynamic_traffic_claims():
+    evidence = Evidence(
+        evidence_id="optimization",
+        source="test",
+        observation="test",
+        attributes={
+            "optimization_status": "optimized",
+            "recommended_plan": {
+                "plan_id": "P1",
+                "supply_demand": {
+                    "status": "allocated",
+                    "method": "capacity_constrained_min_cost_flow_geodesic_proxy",
+                    "served_people": 10,
+                    "unmet_people": 5,
+                    "travel_distance_p95_km": 3.2,
+                },
+            },
+            "gis_stats": {
+                "affected_roads": 3,
+            },
+        },
+    )
+    structured = _extract_structured_data(
+        SkillResult(status="completed", summary="test", evidence=[evidence]),
+        RunState(run_id="audit"),
+    )
+
+    optimization = structured["resource_optimization"]
+    assert optimization["assignment_method"] == (
+        "capacity_constrained_min_cost_flow_geodesic_proxy"
+    )
+    assert optimization["travel_distance_p95_km"] == 3.2
+    counts = structured["infrastructure_counts"]
+    assert counts["affected_roads"] == 3
 
 
 # ------------------------------------------------------------------
@@ -258,6 +401,24 @@ def test_normalize_fusion_branches():
     assert it["evidence_type"] == "spatial_extent"
     assert it["acquisition_time"] == "2026-08-25T00:26:15Z"
     assert it["timestamp"] == "2026-08-25T00:26:15Z"
+
+    # A point-containing tract total is normalized with its actual role;
+    # it is context, not flood exposure.
+    population_items = normalize_fusion_observation({
+        "source": "population_exposure",
+        "source_type": "exposure",
+        "tool": "get_population_exposure",
+        "raw": json.dumps({
+            "status": "ok",
+            "source": "CENSUS",
+            "source_type": "population_context",
+            "population_role": "containing_tract_population",
+            "population": {"total": 4638, "unit": "people"},
+            "note": "Population of the containing tract only.",
+        }),
+    })
+    assert population_items[0]["variable"] == "containing_tract_population"
+    assert population_items[0]["value"] == 4638
     print("PASS normalize_fusion_branches")
 
 
@@ -368,20 +529,6 @@ def test_llm_evidence_compaction_bounded():
     print("PASS llm_evidence_compaction_bounded")
 
 
-if __name__ == "__main__":
-    test_llm_evidence_compaction_bounded()
-    test_extract_structured_data()
-    test_hitl_web_mode()
-    test_normalize_fusion_branches()
-    test_resource_plan_building()
-    test_cdri_scale_and_labels()
-    test_vwun_formula_no_double_hazard()
-    test_vulnerability_profile_counts()
-    test_gis_io_out_path_restriction()
-    test_demo_env_restored_after_run()
-    print("\nALL OFFLINE UNIT TESTS PASSED")
-
-
 # ------------------------------------------------------------------
 # 6. Honesty: explicit accounting of missing inputs (risk engine)
 # ------------------------------------------------------------------
@@ -397,7 +544,7 @@ def test_risk_engine_data_gaps_accounting():
             "profile": {"population_weighted_svi": 0.5, "total_population": 1000},
             "tracts": [],
         },
-        gis_stats={"affected_population": 500, "affected_facilities": 30,
+        gis_stats={"affected_population": 500, "affected_facilities": 30, "facility_inventory_count": 60, "affected_roads": 0,
                    "travel_time_min": None},
         fused_measurements={"facility_count": {"value": 60},
                             "road_count": {"value": 0.0}},
@@ -510,7 +657,10 @@ def test_allocation_equity_objective():
 #    fraction; never multiply by it again
 # ------------------------------------------------------------------
 def test_vwun_formula_no_double_hazard():
-    from app.social_good import compute_vulnerability_weighted_unmet_need
+    from app.social_good import (
+        compute_normalized_vulnerability_weighted_unmet_need,
+        compute_vulnerability_weighted_unmet_need,
+    )
 
     # Hand-computed: P_exposed=3500 (= 4000 population x 0.875
     # flooded fraction), uncovered, SVI 0.92, lambda=1 ->
@@ -529,6 +679,15 @@ def test_vwun_formula_no_double_hazard():
     impacts_covered = [{**impacts[0], "coverage": 1.0}]
     assert compute_vulnerability_weighted_unmet_need(impacts_covered, 1.0) == 0.0
     assert compute_vulnerability_weighted_unmet_need(impacts, 0.0) == 3500.0
+    assert compute_normalized_vulnerability_weighted_unmet_need(
+        impacts, 1.0
+    ) == 1.0
+    assert compute_normalized_vulnerability_weighted_unmet_need(
+        [{**impacts[0], "coverage": 0.25}], 1.0
+    ) == 0.75
+    assert compute_normalized_vulnerability_weighted_unmet_need(
+        impacts_covered, 1.0
+    ) == 0.0
     print("PASS vwun_formula_no_double_hazard")
 
 
@@ -641,54 +800,6 @@ def test_demo_env_restored_after_run():
     print("PASS demo_env_restored_after_run")
 
 
-def test_llm_evidence_compaction_bounded():
-    """Regression for oversized LLM packets: geometry must be
-    summarized, long lists capped, and the packet kept under the
-    hard prompt limit."""
-    from app.agent import _build_compact_packet, _LLM_MAX_PROMPT_CHARS
-
-    big_geojson = {
-        "type": "FeatureCollection",
-        "features": [
-            {"geometry": {"coordinates": [[i * 0.001, i * 0.002]
-                                          for i in range(2000)]}}
-            for _ in range(50)
-        ],
-    }
-    packet = {
-        "task": "assess flooding near Friendswood",
-        "summary": "ok",
-        "evidence": [
-            {"source": "GEE", "geojson": big_geojson,
-             "note": "x" * 5000},
-        ],
-        "spatial_objects": [
-            {"name": f"obj{i}", "geometry": {"coordinates": [[0, 0]]},
-             "attributes": {"a": i}}
-            for i in range(200)
-        ],
-    }
-    compact = _build_compact_packet(packet)
-    size = len(json.dumps(compact, ensure_ascii=False))
-    # After summarization the packet fits the model context budget
-    assert size < _LLM_MAX_PROMPT_CHARS
-    # Geometry summarized (no coordinate strings); type and size kept
-    ev0 = compact["evidence"][0]
-    assert ev0["geojson"]["geometry_omitted"] is True
-    assert ev0["geojson"]["approx_serialized_chars"] > 0
-    assert ev0["note"].startswith("xxx") and "truncated" in ev0["note"]
-    # Long lists capped: 200 objects -> 25 + 1 omission note
-    assert len(compact["spatial_objects"]) == 26
-    assert "more items omitted" in compact["spatial_objects"][-1]
-    print("PASS llm_evidence_compaction_bounded")
-
-
-if __name__ == "__main__":
-    test_risk_engine_data_gaps_accounting()
-    test_allocation_equity_objective()
-    test_equity_gap_or_none_undefined_group()
-
-
 def test_equity_gap_or_none_undefined_group():
     """With homogeneous SVI (no tract above the national top-10%
     threshold) the gap is undefined -> None, while other invalid
@@ -724,6 +835,25 @@ def test_equity_gap_or_none_undefined_group():
             0.90,
         )
     print("PASS equity_gap_or_none_undefined_group")
+
+
+def test_continuous_equity_metric_works_when_threshold_groups_do_not():
+    from app.social_good import (
+        compute_coverage_concentration_index_or_none,
+        compute_equity_gap_or_none,
+    )
+
+    impacts = [
+        {"tract_id": "A", "exposed_population": 100, "coverage": 1.0, "svi": 0.2},
+        {"tract_id": "B", "exposed_population": 100, "coverage": 0.5, "svi": 0.6},
+    ]
+    gap, _ = compute_equity_gap_or_none(impacts, 0.9)
+    concentration, note = compute_coverage_concentration_index_or_none(impacts)
+
+    assert gap is None
+    assert concentration is not None
+    assert concentration < 0
+    assert note == "ok"
 
 
 
@@ -829,3 +959,22 @@ def test_population_affected_source_uses_method_label():
     di_inputs = (structured.get("decision_indices") or {}).get("inputs") or {}
     assert di_inputs.get("affected_population_source") == "census_tract_areal_weighted"
     print("PASS population_affected_source_uses_method_label")
+
+
+if __name__ == "__main__":
+    # Run every zero-argument test in this module in definition order;
+    # unlike the previous hand-maintained call lists this can never
+    # reference a function defined later in the file.
+    import sys
+
+    _failures = []
+    for _name, _fn in list(vars().items()):
+        if _name.startswith("test_") and callable(_fn):
+            try:
+                _fn()
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                _failures.append((_name, exc))
+                print(f"FAIL {_name}: {exc}")
+    if _failures:
+        sys.exit(1)
+    print("\nALL OFFLINE UNIT TESTS PASSED")

@@ -115,8 +115,8 @@ def demand_impacts_for_plan(
     centroid falls within R km of any facility; sensitivity analysis
     exposes the impact of that radius).
 
-    Shared with flood_skill / /api/equity/sensitivity so pipeline
-    numbers and frontend recomputation agree.
+    Legacy binary-radius helper. The current evacuation-plan ledger and
+    lambda endpoint use capacity-assignment demand_impacts instead.
     """
     impacts = []
     for record in demand_records:
@@ -244,6 +244,31 @@ def compute_vulnerability_weighted_unmet_need(
     return total
 
 
+def compute_normalized_vulnerability_weighted_unmet_need(
+    demand_impacts: list[dict[str, Any]],
+    vulnerability_weight: float,
+) -> float:
+    """Return VWUN as a share of the same demand with zero coverage.
+
+    The absolute VWUN remains the optimization metric.  This companion
+    value is bounded to [0, 1] for comparison across plans and events:
+    0 means all weighted demand is served and 1 means none is served.
+    """
+    unmet = compute_vulnerability_weighted_unmet_need(
+        demand_impacts, vulnerability_weight
+    )
+    zero_coverage = [
+        {**impact, "coverage": 0.0}
+        for impact in demand_impacts
+    ]
+    maximum = compute_vulnerability_weighted_unmet_need(
+        zero_coverage, vulnerability_weight
+    )
+    if maximum <= 0:
+        return 0.0
+    return _clamp01(unmet / maximum)
+
+
 def compute_equity_gap(demand_impacts: list[dict[str, Any]], threshold: float) -> float:
     """
     Coverage gap between high- and low-vulnerability tracts.
@@ -292,14 +317,76 @@ def compute_equity_gap_or_none(
         return compute_equity_gap(demand_impacts, threshold), "ok"
     except SocialGoodError as exc:
         if "both high- and lower-SVI groups" in str(exc):
-            return None, (
-                "undefined: no demand tract at/above the national "
-                f"top-10% SVI threshold ({threshold:.2f})"
+            high_count = sum(
+                1
+                for impact in demand_impacts
+                if float(impact["svi"]) >= threshold
             )
+            if high_count == 0:
+                reason = (
+                    "undefined: no demand tract at/above the national "
+                    f"top-10% SVI threshold ({threshold:.2f})"
+                )
+            else:
+                reason = (
+                    "undefined: no demand tract below the national "
+                    f"top-10% SVI threshold ({threshold:.2f})"
+                )
+            return None, reason
         raise
+
+
+def compute_coverage_concentration_index_or_none(
+    demand_impacts: list[dict[str, Any]],
+) -> tuple[float | None, str]:
+    """Population-weighted concentration index for coverage by SVI rank.
+
+    Tracts are ordered from lower to higher SVI. The weighted concentration
+    index is positive when coverage favors more-vulnerable tracts and negative
+    when it favors less-vulnerable tracts. Unlike the threshold gap, it uses
+    no arbitrary SVI cut point.
+    """
+    if not demand_impacts:
+        return None, "undefined: no demand impacts"
+
+    rows: list[tuple[float, float, float]] = []
+    for impact in demand_impacts:
+        svi = _finite(impact.get("svi"))
+        coverage = _finite(impact.get("coverage"))
+        population = _finite(impact.get("exposed_population"))
+        if svi is None or coverage is None or population is None:
+            raise SocialGoodError(
+                "Coverage concentration index requires svi, coverage, and "
+                "exposed_population for every impact."
+            )
+        if not (0 <= svi <= 1 and 0 <= coverage <= 1) or population < 0:
+            raise SocialGoodError(
+                "Coverage concentration inputs are outside valid ranges."
+            )
+        if population > 0:
+            rows.append((svi, coverage, population))
+
+    if not rows:
+        return None, "undefined: zero exposed population"
+    if len({row[0] for row in rows}) < 2:
+        return None, "undefined: SVI has no cross-tract variation"
+
+    rows.sort(key=lambda row: row[0])
+    total_population = sum(row[2] for row in rows)
+    mean_coverage = sum(row[1] * row[2] for row in rows) / total_population
+    if mean_coverage <= 0:
+        return None, "undefined: mean coverage is zero"
+
+    cumulative = 0.0
+    weighted_covariance = 0.0
+    for _svi, coverage, population in rows:
+        fractional_rank = (cumulative + population / 2.0) / total_population
+        weighted_covariance += population * coverage * (fractional_rank - 0.5)
+        cumulative += population
+    index = 2.0 * weighted_covariance / (total_population * mean_coverage)
+    return max(-1.0, min(1.0, index)), "ok"
 
 
 # ============================================================================
 # Weight-rationale helpers (for reports)
 # ============================================================================
-

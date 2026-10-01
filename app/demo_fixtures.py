@@ -147,9 +147,13 @@ def _load_demo_road_cache():
             payload = json.load(fh)
         nodes = {k: (float(v[0]), float(v[1])) for k, v in payload["nodes"].items()}
         adj: dict = {}
-        for u, v, length_m, geom in payload["edges"]:
-            w = float(length_m)
-            adj.setdefault(str(u), []).append((str(v), w, geom))
+        # Edges are written as [u, v, length_m, coords, attrs] by the
+        # current cache builder; older caches lack the attrs element.
+        # Both layouts are accepted so a rebuilt cache keeps working.
+        for edge in payload["edges"]:
+            u, v, length_m = str(edge[0]), str(edge[1]), float(edge[2])
+            geom = edge[3] if len(edge) >= 4 else None
+            adj.setdefault(u, []).append((v, length_m, geom))
         _demo_road_cache = (nodes, adj)
     except (OSError, ValueError, KeyError, TypeError):
         _demo_road_cache = None
@@ -305,14 +309,33 @@ class FakeMCP:
 
     def _fx_get_flood_observation(self, args):
         # Historical replay: observation time lands inside the
-        # requested window (time alignment is verified by the pipeline)
+        # requested window (time alignment is verified by the pipeline).
+        # Windowed queries return the window PEAK as the primary value
+        # plus a full hydrograph summary (same contract as the real
+        # USGS IV MCP since 2026-09-26).
         obs_time = NOW
+        window_summary = None
+        semantics = "latest_instantaneous"
         if args.get("start_dt"):
             try:
                 _start = datetime.fromisoformat(
                     str(args["start_dt"]).replace("Z", "+00:00")
                 )
+                _end = datetime.fromisoformat(
+                    str(args["end_dt"]).replace("Z", "+00:00")
+                )
                 obs_time = (_start + timedelta(hours=6)).isoformat()
+                semantics = "window_peak"
+                window_summary = {
+                    "start": args["start_dt"],
+                    "end": args["end_dt"],
+                    "value_count": 97,
+                    "peak_stage_ft": 8.0,
+                    "peak_time": obs_time,
+                    "end_stage_ft": 6.2,
+                    "end_time": (_end - timedelta(hours=1)).isoformat(),
+                    "min_stage_ft": 2.1,
+                }
             except ValueError:
                 pass
         return {
@@ -327,6 +350,8 @@ class FakeMCP:
                 "water_level": 8.0,
                 "unit": "ft",
                 "observation_time": obs_time,
+                "observation_semantics": semantics,
+                "window_summary": window_summary,
                 "source": "USGS",
                 "station_name": "Clear Ck nr Friendswood, TX",
                 "latitude": 29.5175,
@@ -334,6 +359,45 @@ class FakeMCP:
                 "metadata_verified": True,
                 "location_verified": True,
             },
+        }
+
+    def _fx_get_waterway_network(self, args):
+        # Two waterways through the fixture city square
+        # (-95.25..-94.95, 29.35..29.65): a diagonal main stem and a
+        # north-south tributary crossing the flood polygon.
+        return {
+            "status": "ok",
+            "source": "OSM",
+            "source_type": "waterway_network",
+            "timestamp": NOW,
+            "location": {
+                "latitude": args.get("latitude"),
+                "longitude": args.get("longitude"),
+            },
+            "waterways": [
+                {
+                    "osm_id": 1001,
+                    "name": "Clear Creek",
+                    "waterway": "river",
+                    "coordinates": [
+                        [-95.30, 29.40], [-95.20, 29.45],
+                        [-95.10, 29.50], [-95.00, 29.55],
+                        [-94.90, 29.60],
+                    ],
+                },
+                {
+                    "osm_id": 1002,
+                    "name": "Mary's Creek",
+                    "waterway": "stream",
+                    "coordinates": [
+                        [-95.13, 29.65], [-95.12, 29.55],
+                        [-95.11, 29.45], [-95.10, 29.35],
+                    ],
+                },
+            ],
+            "waterway_count": 2,
+            "radius_km": args.get("radius_km", 15),
+            "metadata_verified": True,
         }
 
     def _fx_get_nwps_gauge(self, args):
@@ -428,7 +492,8 @@ class FakeMCP:
         return {
             "status": "ok",
             "source": "CENSUS",
-            "source_type": "population_exposure",
+            "source_type": "population_context",
+            "population_role": "containing_tract_population",
             "population": {"total": 8500, "unit": "people"},
             "note": (
                 "population returned for the census tract containing "
@@ -493,12 +558,23 @@ class FakeMCP:
         }
 
     def _fx_get_critical_infrastructure(self, args):
+        facilities = [
+            {
+                "id": i,
+                "type": "school",
+                "latitude": 29.50 if i < 6 else 29.58,
+                "longitude": -95.11 if i < 6 else -95.18,
+            }
+            for i in range(12)
+        ]
         return {
             "status": "ok",
             "source": "OSM",
+            "source_type": "infrastructure",
             "measurements": {
                 "facility_count": {"value": 12, "unit": "facilities"},
             },
+            "metadata": {"facilities": facilities},
             "timestamp": NOW,
         }
 
@@ -934,7 +1010,6 @@ FUSION_SOURCES = [
 # process environment take precedence — setdefault semantics).
 DEMO_ENV = {
     "FLOOD_STATION_MAX_DISTANCE_KM": "50",
-    "NWS_WARNING_RADIUS_KM": "25",
     "SVI_RADIUS_KM": "10",
     "SVI_MAX_FEATURES": "500",
     "VULNERABILITY_WEIGHT": "1.0",

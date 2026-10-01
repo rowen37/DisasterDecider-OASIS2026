@@ -38,7 +38,7 @@ from app.demo_fixtures import (          # noqa: E402
 async def test_flood_decider_demo_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setenv("HITL_ENABLED", "false")
     monkeypatch.setenv("FLOOD_STATION_MAX_DISTANCE_KM", "50")
-    monkeypatch.setenv("NWS_WARNING_RADIUS_KM", "25")
+    monkeypatch.delenv("NWS_WARNING_RADIUS_KM", raising=False)
     monkeypatch.setenv("SVI_RADIUS_KM", "10")
     monkeypatch.setenv("SVI_MAX_FEATURES", "500")
     monkeypatch.setenv("VULNERABILITY_WEIGHT", "1.0")
@@ -117,6 +117,10 @@ async def test_flood_decider_demo_end_to_end(tmp_path, monkeypatch):
     assert attrs["inputs"]["hazard_basis"] == "water_severity"
     assert attrs["inputs"]["extent_ratio"] is not None
     assert attrs["data_gaps"] == []
+    assert not any(
+        "precipitation" in action.lower() and "obtain" in action.lower()
+        for action in result.next_actions
+    )
     # All components computed -> no degraded suffix on the label
     assert "(degraded" not in attrs["cdri_risk_label"]
     # City-boundary clipping works: the analysis area uses the
@@ -157,55 +161,78 @@ async def test_flood_decider_demo_end_to_end(tmp_path, monkeypatch):
     assert opt_attrs.get("optimization_status") == "optimized"
     ledger = opt_attrs.get("equity_ledger") or {}
     assert ledger.get("demand_tract_count") == 2
-    # Frontier shape: 6 candidates -> 5 non-dominated; west matches
-    # east on all five operational objectives but only covers the
-    # low-SVI tract, so east dominates it out of the frontier
+    # Response-only plans are not evacuation plans, and equal-capacity
+    # hospital plans are dominated when a cheaper/faster shelter or mixed
+    # plan serves the same number of people.
     curve = {
         e["plan_id"]: e
         for e in ledger.get("frontier_equity_curve", [])
     }
-    assert set(curve) == {
-        "plan_shelter_top1", "plan_fire_top1",
-        "plan_hospital_east", "plan_mixed_1_each", "plan_hospital_top2",
-    }
-    assert "plan_hospital_west" not in curve
-    # Cost-VWUN trade-off ladder: the cheapest plan leaves the most
-    # unmet need; the recommended top2 (two hospitals) covers both
-    # tracts -> VWUN=0, gap=0
+    assert set(curve) == {"plan_shelter_top1", "plan_mixed_1_each"}
+    # Cost-VWUN trade-off ladder: the cheapest plan leaves the most unmet
+    # need; the mixed plan supplies more eligible capacity.
     assert (
         curve["plan_shelter_top1"]["vulnerability_weighted_unmet_need"]
-        > curve["plan_hospital_top2"]["vulnerability_weighted_unmet_need"]
-        == 0
+        > curve["plan_mixed_1_each"]["vulnerability_weighted_unmet_need"]
+    )
+    assert curve["plan_mixed_1_each"]["served_people"] == 200
+    assert curve["plan_mixed_1_each"]["unmet_people"] > 0
+    supply = ledger.get("supply_demand") or {}
+    assert supply.get("status") == "allocated"
+    assert supply.get("method") == (
+        "capacity_constrained_min_cost_flow_geodesic_proxy"
+    )
+    assert supply.get("served_people") == 200
+    assert supply.get("unmet_people") == 4237
+    assert supply.get("travel_distance_p95_km", 0) > 0
+    assert supply.get("transfer_time_estimate_range_minutes") is None
+    assert supply.get("planning_gaps") == ["transfer_time_estimate"]
+    assert all(
+        item["assigned_people"] <= item["capacity"]
+        for item in supply.get("facility_utilization", [])
     )
     assert ledger.get("vulnerability_weighted_unmet_need", -1) >= 0
-    assert ledger.get("equity_gap", -2) >= 0
+    assert 0 <= ledger.get(
+        "normalized_vulnerability_weighted_unmet_need", -1
+    ) <= 1
+    # Negative is now a meaningful result: the high-SVI tract receives
+    # a smaller served share after capacity constraints are enforced.
+    assert -1.0 <= ledger.get("equity_gap", -2) <= 1.0
     # VWUN formula regression (closed-form recomputation):
     # exposed_population already includes the flooded fraction, so
     # the formula must not multiply by flooded_fraction again
-    from app.social_good import (
-        compute_vulnerability_weighted_unmet_need,
-        demand_impacts_for_plan,
-    )
+    from app.social_good import compute_vulnerability_weighted_unmet_need
     ctx0 = ledger.get("sensitivity_context") or {}
-    _records = ctx0.get("demand_records") or []
-    assert _records, "sensitivity_context.demand_records missing"
-    _uncovered = demand_impacts_for_plan(_records, [], 2.0)
+    impacts_by_plan = ctx0.get("frontier_plan_impacts") or {}
     _expected = round(
-        compute_vulnerability_weighted_unmet_need(_uncovered, 1.0), 2
+        compute_vulnerability_weighted_unmet_need(
+            impacts_by_plan["plan_shelter_top1"], 1.0
+        ),
+        2,
     )
     assert curve["plan_shelter_top1"][
         "vulnerability_weighted_unmet_need"
     ] == _expected
-    # Coverage-radius sensitivity: equity metrics recomputed at each
-    # radius around the operating assumption
-    sweep = ledger.get("coverage_radius_sensitivity") or []
-    assert {s["radius_km"] for s in sweep} == {2.0, 5.0, 10.0}
-    assert any(s["is_operating_radius"] for s in sweep)
-    # Frontend recomputation context (lambda / radius endpoints;
-    # 5 frontier plans support flip previews)
+    # Frontend recomputation uses the actual capacity assignments.
     ctx = ledger.get("sensitivity_context") or {}
-    assert ctx.get("recommended_allocation_points")
-    assert len(ctx.get("frontier_plans") or []) == 5
+    assert ctx.get("frontier_plan_impacts")
+    assert len(ctx.get("frontier_plans") or []) == 2
+    assert ctx.get("base_objective_weights")
+    base_weights = dict(ctx["base_objective_weights"])
+    if any(o["name"] == "vulnerability_coverage" for o in ctx["optimization_objectives"]):
+        base_weights["vulnerability_coverage"] = (
+            base_weights.get("vulnerability_coverage", 0.0)
+            + ctx["vulnerability_weight"] * ctx["population_weighted_svi"]
+        )
+    total_weight = sum(base_weights.get(o["name"], 0.0) for o in ctx["optimization_objectives"])
+    for objective in ctx["optimization_objectives"]:
+        name = objective["name"]
+        assert ctx["weights_used"][name] == pytest.approx(
+            base_weights.get(name, 0.0) / total_weight, abs=2e-6
+        )
+    scenarios = opt_attrs.get("plan_scenarios") or []
+    assert scenarios
+    assert all(item["plan_id"] in curve for item in scenarios)
 
     # Equity objective genuinely participates (weight applied +
     # objective active)
@@ -339,11 +366,20 @@ async def test_no_flood_extent_explicitly_reported(tmp_path, monkeypatch):
     )
 
     assert result.status == "completed", result.summary
-    # next_actions states that no extent was found and what was
-    # skipped, instead of leaving the user guessing
+    codes = {i.code for i in result.validation_issues}
+    # Policy since 2026-09-26: satellite "nothing detected" no longer
+    # cancels the spatial picture when the verified gauge crossed
+    # action stage (8.0 >= 7.0 here). A MODELED stage-buffer extent
+    # substitutes and every surface discloses it.
+    assert "EXTENT_FALLBACK_MODELED" in codes
     assert any(
-        "No satellite flood extent" in a for a in result.next_actions
+        "MODELED" in a and "stage-buffer" in a
+        for a in result.next_actions
     ), result.next_actions
+    assert (state.gis_results.get("stats") or {}).get(
+        "extent_provenance"
+    ) == "modeled_stage_buffer"
+    assert (state.gis_results or {}).get("map_path")
     # Decision indices record the degradation honestly
     attrs = {}
     for ev in result.evidence:
@@ -352,9 +388,12 @@ async def test_no_flood_extent_explicitly_reported(tmp_path, monkeypatch):
     assert attrs["inputs"]["hazard_basis"] == (
         "water_severity"
     )
-    assert "flooded_area_km2" in attrs["data_gaps"]
-    # No map file path
-    assert not (getattr(state, "gis_results", {}) or {}).get("map_path")
+    # The modeled area feeds spatial analysis, while the missing observed
+    # extent remains an explicit gap and the hazard stays water-driven.
+    assert "flooded_area_km2" not in attrs["data_gaps"]
+    assert "observed_flood_extent" in attrs["data_gaps"]
+    assert "(degraded:" in attrs["cdri_risk_label"]
+    assert attrs["inputs"]["extent_ratio"] is not None
 
 
 # ----------------------------------------------------------------------
@@ -474,7 +513,7 @@ async def test_far_station_warns_but_completes(tmp_path, monkeypatch):
 # frontier equity curve / lambda recomputation
 # ----------------------------------------------------------------------
 def test_uncertainty_band_in_indices():
-    """CDRI decision indices must carry a +/-10% component envelope
+    """CDRI decision indices must carry a +/-0.1 component envelope
     and the top-2 sensitive components."""
     import sys, os
     sys.path.insert(0, os.path.join(
@@ -510,7 +549,7 @@ def _risk_inputs_like_demo(**overrides):
         },
         gis_stats={"affected_population": 4437,
                    "affected_population_method": "areal_weighted",
-                   "affected_facilities": 30, "travel_time_min": None},
+                   "affected_facilities": 30, "facility_inventory_count": 60, "affected_roads": 0, "travel_time_min": None},
         fused_measurements={"facility_count": {"value": 60},
                             "road_count": {"value": 42}},
         fusion_sources=[{"tool": "get_road_status",
@@ -618,13 +657,15 @@ async def test_frontier_equity_curve(tmp_path, monkeypatch):
         if isinstance(_l, dict):
             ledger = _l
     curve = ledger.get("frontier_equity_curve") or []
-    # Six demo fixture candidates: five non-dominated (cost-VWUN
-    # ladder) + one dominated
-    assert len(curve) >= 3
+    # Only feasible, non-dominated evacuation plans enter the curve.
+    assert len(curve) == 2
     for entry in curve:
         assert entry["plan_id"]
         assert entry["cost"] is not None
         assert entry["vulnerability_weighted_unmet_need"] >= 0
+        assert 0 <= entry[
+            "normalized_vulnerability_weighted_unmet_need"
+        ] <= 1
         assert isinstance(entry["covered_tract_ids"], list)
         assert isinstance(entry["covered_high_svi_tract_ids"], list)
     # Ledger also carries the recommended plan's demand_impacts
@@ -646,7 +687,14 @@ def test_authority_tier_matching():
         "authoritative_government", 1.0,
     )
     assert _authority("NWS")[1] == 1.0
-    assert _authority("Google Earth Engine / Sentinel-1 SAR")[1] == 0.8
+    # Sentinel-derived flood extents are our own change-detection
+    # product on an authoritative platform: revisit latency (6-12 d)
+    # makes acquisition timing uncertain vs a flood peak and single-pair
+    # change detection has known false positives, so it tiers BELOW
+    # operational gauge/hydrology sources (2026-09-26 rework).
+    assert _authority("Google Earth Engine / Sentinel-1 SAR") == (
+        "authoritative_platform_derived_product", 0.6,
+    )
     assert _authority("CDC/ATSDR SVI 2022")[1] == 1.0
     assert _authority("OSM Overpass + MANUAL capacity table")[1] == 0.8
     # Genuinely unknown sources still get 0.5 -- tiers are not
@@ -865,6 +913,21 @@ async def test_historical_replay_time_alignment(tmp_path, monkeypatch):
         if "decision_indices" in (ev.attributes or {}):
             attrs = ev.attributes["decision_indices"]
     assert attrs["inputs"]["hazard_basis"] == "water_severity"
+    # 4b) Historical replay judges the event by its window PEAK, not
+    # the window-end snapshot (Lodi NJ 2026-09-13 case); the primary
+    # evidence carries the full hydrograph summary.
+    main_ev = next(
+        ev for ev in result.evidence
+        if str(ev.evidence_id).startswith("usgs_station_")
+    )
+    assert main_ev.attributes["observation_semantics"] == "window_peak"
+    assert main_ev.attributes["window_summary"]["peak_stage_ft"] == 8.0
+    assert main_ev.attributes["window_summary"]["end_stage_ft"] == 6.2
+    assert "peaked at" in result.summary
+    # Satellite-observed provenance flag (not the modeled fallback)
+    assert (state.gis_results.get("stats") or {}).get(
+        "extent_provenance"
+    ) == "satellite_sar"
     # 5) Replay freshness is judged against the event window: quality
     # is not penalized by old timestamps or the current date
     assert attrs["data_confidence"] >= 0.6
@@ -921,19 +984,42 @@ async def test_sar_stale_gate_blocks_misaligned_extent(tmp_path, monkeypatch):
     assert result.status == "completed", result.summary
     codes = {i.code for i in result.validation_issues}
     assert "SAR_EXTENT_STALE" in codes
-    # Stale area must not enter CDRI: hazard degrades to the water
-    # ratio only
+    # Policy since 2026-09-26 (prefer over-alert over silent miss): a
+    # stale satellite layer is discarded, but when the verified gauge
+    # peak reached action stage the spatial products continue on a
+    # MODELED stage-buffer extent, fully disclosed.
+    assert "EXTENT_FALLBACK_MODELED" in codes
     attrs = {}
     for ev in result.evidence:
         if "decision_indices" in (ev.attributes or {}):
             attrs = ev.attributes["decision_indices"]
+    # Stale satellite area must not enter CDRI: hazard stays the water
+    # dimension only (extent is spatial context, never a hazard factor)
     assert attrs["inputs"]["hazard_basis"] == (
         "water_severity"
     )
-    assert "flooded_area_km2" in attrs["data_gaps"]
-    # Downstream GIS products are skipped (a mismatched layer must not
-    # drive rescue routes)
-    assert not (state.gis_results or {}).get("map_path")
+    # The modeled extent substitutes for spatial analysis, but the absent
+    # observation remains a disclosed gap.
+    assert "flooded_area_km2" not in attrs["data_gaps"]
+    assert "observed_flood_extent" in attrs["data_gaps"]
+    assert "(degraded:" in attrs["cdri_risk_label"]
+    assert attrs["inputs"]["extent_ratio"] is not None
+    assert (state.gis_results.get("stats") or {}).get(
+        "extent_provenance"
+    ) == "modeled_stage_buffer"
+    extent_obj = {
+        o.object_id: o for o in result.spatial_objects
+    }.get("flood_inundation_extent")
+    assert extent_obj is not None
+    assert extent_obj.attributes["extent_provenance"] == (
+        "modeled_stage_buffer"
+    )
+    assert "Modeled stage-buffer" in extent_obj.source
+    # Downstream GIS products run on the modeled layer (the mismatched
+    # SATELLITE layer still must not drive rescue routes)
+    assert (state.gis_results or {}).get("map_path")
+    model = (state.gis_results.get("stats") or {}).get("extent_model")
+    assert model and model["radius_basis"] == "nwps_category_anchored"
 
 
 @pytest.mark.asyncio
@@ -999,14 +1085,11 @@ async def test_zero_incity_overlap_keeps_buffer_context_layer(
 
 
 @pytest.mark.asyncio
-async def test_gauge_inbank_with_satellite_water_fires_contradiction(
+async def test_uncorroborated_satellite_water_is_not_a_flood_extent(
     tmp_path, monkeypatch,
 ):
-    """Regression for the realtime false-positive case: an in-bank
-    1.5 ft gauge while satellite change detection reports widespread
-    "flooding" -> CDRI must go to 0 (water level is the primary
-    evidence) with a SAR_EXTENT_STAGE_CONTRADICTION warning (no score
-    bump, no silence)."""
+    """An in-bank gauge plus no flood warning cannot promote a raw SAR
+    change footprint into an operational flood map."""
     _env_defaults(monkeypatch)
 
     async def _geocode(args):
@@ -1042,11 +1125,19 @@ async def test_gauge_inbank_with_satellite_water_fires_contradiction(
             "data_quality": {"geometry_returned": True},
         })
 
+    async def _no_warnings(args):
+        return json.dumps({
+            "status": "ok",
+            "source": "NWS",
+            "alerts": [],
+        })
+
     state = RunState(run_id="inbank-contradiction")
     mcp = FakeMCP()
     mcp._fx_geocode_location = _geocode
     mcp._fx_get_flood_observation = _low_stage
     mcp._fx_get_flood_extent = _big_extent
+    mcp._fx_get_flood_warnings = _no_warnings
 
     skill = FloodSkill(
         state, Verifier(), AdaptiveHITL(state), mcp,
@@ -1059,7 +1150,7 @@ async def test_gauge_inbank_with_satellite_water_fires_contradiction(
 
     assert result.status == "completed", result.summary
     codes = {i.code for i in result.validation_issues}
-    assert "SAR_EXTENT_STAGE_CONTRADICTION" in codes
+    assert "SAR_EXTENT_UNCORROBORATED" in codes
     attrs = {}
     for ev in result.evidence:
         if "decision_indices" in (ev.attributes or {}):
@@ -1068,17 +1159,15 @@ async def test_gauge_inbank_with_satellite_water_fires_contradiction(
     assert attrs["inputs"]["water_severity"] == 0.0
     assert attrs["components"]["hazard"] == 0.0
     assert attrs["cdri"] == 0.0
-    # Footprint still disclosed as spatial context (area share
-    # recorded)
-    assert attrs["inputs"]["extent_severity"] is not None
-    # Second guardrail: building density in the footprint is very low
-    # (7/17.4 = 0.4/km^2 < 5) -> the suspected-false-positive alert
-    # must fire
-    assert "SAR_EXTENT_SUSPECTED_FALSE_POSITIVE" in codes
-    # POI search follows the footprint: scope recorded as flood_footprint
+    # The raw candidate stays auditable but cannot enter flood severity,
+    # exposure, routing, or the map.
+    assert attrs["inputs"]["extent_severity"] is None
+    assert "flooded_area_km2" in attrs["data_gaps"]
+    assert not (state.gis_results or {}).get("flood_boundary_path")
+    assert not (state.gis_results or {}).get("map_path")
     assert (state.gis_results.get("stats") or {}).get(
-        "poi_search_scope"
-    ) == "flood_footprint"
+        "unverified_surface_water_area_km2"
+    ) is not None
 
 
 @pytest.mark.asyncio
@@ -1113,6 +1202,55 @@ async def test_poi_search_failure_disclosed(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_facility_search_uses_30_then_60_minute_service_areas(
+    tmp_path, monkeypatch
+):
+    """At 30 km/h the facility query uses 15 km first and expands to
+    30 km only when the primary service area is valid but empty."""
+    _env_defaults(monkeypatch)
+    monkeypatch.setenv("GIS_FACILITY_PLANNING_SPEED_KMH", "30")
+    monkeypatch.setenv("GIS_FACILITY_PRIMARY_SERVICE_MINUTES", "30")
+    monkeypatch.setenv("GIS_FACILITY_EXTENDED_SERVICE_MINUTES", "60")
+
+    state = RunState(run_id="facility-service-areas")
+    mcp = FakeMCP()
+    default_poi = mcp._fx_poi_search_osm
+    facility_radii = []
+
+    def _poi_by_service_area(args):
+        if "building" in str(args.get("amenity_types", "")):
+            return default_poi(args)
+        facility_radii.append(args["radius_m"])
+        if len(facility_radii) == 1:
+            return {
+                "status": "ok",
+                "output_path": str(tmp_path / "empty-primary.geojson"),
+                "feature_list": [],
+                "total_found": 0,
+            }
+        return default_poi(args)
+
+    mcp._fx_poi_search_osm = _poi_by_service_area
+    skill = FloodSkill(
+        state, Verifier(), AdaptiveHITL(state), mcp,
+        ExperimentLogger(path=str(tmp_path / "traj.jsonl")),
+    )
+    result = await skill.run(
+        "Friendswood", station_id="08077600",
+        raw_task="assess flooding near Friendswood using USGS 08077600",
+    )
+
+    assert result.status == "completed", result.summary
+    assert facility_radii == [15000.0, 30000.0]
+    stats = state.gis_results["stats"]
+    assert stats["poi_search_tier"] == "extended_60_minute"
+    assert stats["poi_search_radius_km"] == 30.0
+    assert stats["facility_primary_service_radius_km"] == 15.0
+    assert stats["facility_extended_service_radius_km"] == 30.0
+    assert state.gis_results.get("rescue_route_path")
+
+
+@pytest.mark.asyncio
 async def test_demo_mode_guarantees_slider_data(tmp_path, monkeypatch):
     """Web demo contract: a one-click run must produce the equity
     ledger plus flip-preview context (the lambda slider's data) in
@@ -1129,12 +1267,8 @@ async def test_demo_mode_guarantees_slider_data(tmp_path, monkeypatch):
             _l = (ev.attributes or {}).get("equity_ledger")
             if isinstance(_l, dict):
                 ledger = _l
-        # Slider essentials: demand_impacts (lambda recomputation),
-        # sensitivity_context (radius recomputation + frontier flip
-        # preview), and the radius sensitivity sweep
+        # Slider essentials: actual assignment impacts and frontier data.
         assert isinstance(ledger.get("demand_impacts"), list) and ledger["demand_impacts"]
         ctx = ledger.get("sensitivity_context") or {}
-        assert ctx.get("demand_records") and ctx.get("frontier_plans")
+        assert ctx.get("frontier_plan_impacts") and ctx.get("frontier_plans")
         assert ctx.get("optimization_objectives") and ctx.get("weights_used")
-        sweep = ledger.get("coverage_radius_sensitivity") or []
-        assert {s["radius_km"] for s in sweep} == {2.0, 5.0, 10.0}

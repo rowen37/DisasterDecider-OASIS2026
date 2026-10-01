@@ -24,8 +24,16 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "mcp_servers",
+    ),
+)
 
 from app.utils import geodesic_km  # noqa: E402
+from gis_vector_server import _evacuation_edge_attributes  # noqa: E402
 
 # Demo scenario endpoints: Friendswood assessment target -> Demo Hospital (POI fixture)
 ORIGIN = (29.5294, -95.2010)
@@ -66,7 +74,7 @@ def main() -> None:
         for n, d in G.nodes(data=True)
     }
     edges = []
-    for u, v, data in G.edges(data=True):
+    for u, v, key, data in G.edges(keys=True, data=True):
         geom = data.get("geometry")
         if geom is not None:
             coords = [[round(p[0], 6), round(p[1], 6)] for p in geom.coords]
@@ -93,7 +101,13 @@ def main() -> None:
                     nodes[str(v)][0], nodes[str(v)][1],
                 ) * 1000.0,
             ))
-        edges.append([str(u), str(v), round(length_m, 1), coords])
+        attrs = _evacuation_edge_attributes(data)
+        attrs.update({
+            "blocked": False,
+            "osm_key": str(key),
+            "capacity_assumed": data.get("lanes") is None,
+        })
+        edges.append([str(u), str(v), round(length_m, 1), coords, attrs])
 
     payload = {
         "meta": {

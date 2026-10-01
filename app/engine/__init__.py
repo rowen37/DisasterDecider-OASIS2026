@@ -15,6 +15,7 @@ Shared:
     geometry_engine       spatial clipping, areal-weighted exposure
     allocation_engine     resource plans, Pareto optimization, equity objective
     pareto_engine         multi-objective Pareto frontier and plan selection
+    supply_demand_engine  capacity-constrained demand-to-facility assignment
 """
 
 from .allocation_engine import AllocationEngine  # noqa: F401
@@ -31,12 +32,14 @@ from .pareto_engine import (  # noqa: F401
     select_best_pareto_plan,
 )
 from .flood_risk_engine import RiskEngine  # noqa: F401
+from .supply_demand_engine import SupplyDemandEngine  # noqa: F401
 
 __all__ = [
     "AllocationEngine",
     "ClipResult",
     "GeometryEngine",
     "RiskEngine",
+    "SupplyDemandEngine",
     "fuse_flood_evidence",
     "normalize_fusion_observation",
     "pareto_frontier",

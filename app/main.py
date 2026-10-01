@@ -19,6 +19,11 @@ from pydantic_settings.exceptions import IncompleteFieldDefinitionWarning
 from .agent import FinalDecisionAgent, StrategySelector
 from .utils import safe_float as _safe_float
 from .experiment import ExperimentLogger
+from .historical_validation import (
+    flood_category,
+    load_default_manifest,
+    validate_manifest,
+)
 from .hitl import AdaptiveHITL
 from .ops import OpsExecutor
 from .models import HazardType, RunState, SkillResult
@@ -58,6 +63,14 @@ class AssessRequest(BaseModel):
     # Demo mode: FakeMCP offline pipeline (zero network dependency);
     # yields full indices + equity ledger for any date.
     demo: bool = False
+
+
+class PlanSelectionRequest(BaseModel):
+    run_id: str
+    scenario_id: str
+    plan_id: str
+    selected_by: str = "operator"
+    note: str | None = None
 
 # ---------------------------------------------------------------------
 # 1. CLI single-run
@@ -181,6 +194,11 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
         "major_stage": None,
         "station_id": None,
         "station_name": None,
+        "observation_time": None,
+        "observation_semantics": None,
+        "window_summary": None,
+        "assessment_mode": "realtime",
+        "time_alignment": None,
         "station_lat": None,
         "station_lon": None,
         "target_lat": None,
@@ -189,7 +207,9 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
         "svi": None,
         "svi_population": None,
         "svi_tracts": None,
-        "population_exposure": None,
+        "svi_scope": None,
+        "svi_radius_km": None,
+        "population_context": None,
         "population_total": None,
         "population_affected": None,
         "population_affected_source": None,
@@ -203,11 +223,18 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
         "alert_count": 0,
         "flooded_area_km2": None,
         "flood_extent": None,
+        "extent_provenance": None,
+        "extent_model": None,
+        "extent_confidence": None,
+        "extent_timestamp": None,
         "precipitation": None,
         "forecast": None,
         # Per-period forecast details (temperature, precipitation
         # probability, etc.) for the sidebar
         "forecast_periods": [],
+        "hydrologic_category": None,
+        "next_flood_threshold": None,
+        "next_actions": list(result.next_actions),
     }
 
     # Target info from state.spatial_objects
@@ -229,6 +256,18 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
         if "station_id" in attrs:
             structured["station_id"] = attrs["station_id"]
             structured["station_name"] = attrs.get("station_name")
+            structured["observation_time"] = attrs.get("observation_time")
+            structured["observation_semantics"] = attrs.get(
+                "observation_semantics"
+            )
+            structured["window_summary"] = attrs.get("window_summary")
+            if attrs.get("observation_semantics") == "window_peak":
+                structured["assessment_mode"] = "historical"
+            if isinstance(attrs.get("time_alignment"), dict):
+                structured["time_alignment"] = attrs["time_alignment"]
+                structured["assessment_mode"] = attrs["time_alignment"].get(
+                    "mode", structured["assessment_mode"]
+                )
             structured["station_lat"] = attrs.get("station_latitude")
             structured["station_lon"] = attrs.get("station_longitude")
             if structured["target_lat"] is None:
@@ -248,11 +287,13 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
             structured["svi_population"] = attrs.get("total_population")
             structured["population_total"] = attrs.get("total_population")
             structured["svi_tracts"] = attrs.get("tract_count")
+            structured["svi_scope"] = attrs.get("tract_scope")
+            structured["svi_radius_km"] = attrs.get("radius_km")
 
-        # Population exposure and temperature come only from structured
-        # fields (fusion population_exposure in the multi_source_fusion
-        # branch below; temperature backfilled after the loop), never
-        # guessed from free-text prose.
+        # Population context and temperature come only from structured
+        # fields (the containing-tract population in the fusion branch
+        # below; temperature is backfilled after the loop), never guessed
+        # from free-text prose.  Population context is not exposure.
 
         # Alerts: only fused evidence with source_type == "warning"
         # counts. Do not substring-match "alert" in ev.source;
@@ -332,13 +373,16 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
                 if not isinstance(item, dict):
                     continue
                 raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-                if raw.get("source_type") == "population_exposure":
+                if raw.get("source_type") in {
+                    "population_context",
+                    "population_exposure",  # compatibility with older MCP output
+                }:
                     population = raw.get("population", {})
                     if isinstance(population, dict) and population.get("total") is not None:
-                        # Census returns the containing-tract population.  It
-                        # is surfaced as exposure, never mislabeled as a
-                        # radius-wide city total.
-                        structured["population_exposure"] = population["total"]
+                        # This MCP returns the containing tract's population,
+                        # not flood exposure.  Keep it as contextual evidence
+                        # and never use it as affected_population.
+                        structured["population_context"] = population["total"]
                 if raw.get("source_type") == "infrastructure":
                     measurements = raw.get("measurements", {})
                     if isinstance(measurements, dict):
@@ -359,6 +403,7 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
         # (auditable: whether the SVI weight took effect)
         if attrs.get("optimization_status") is not None:
             rec = attrs.get("recommended_plan") or {}
+            supply_demand = rec.get("supply_demand") or {}
             structured["resource_optimization"] = {
                 "status": attrs.get("optimization_status"),
                 "svi_weight_applied": attrs.get("svi_weight_applied"),
@@ -366,7 +411,25 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
                 "vulnerability_coverage": (rec.get("objectives") or {}).get(
                     "vulnerability_coverage"
                 ),
+                "served_people": supply_demand.get("served_people"),
+                "unmet_people": supply_demand.get("unmet_people"),
+                "assignment_method": supply_demand.get("method"),
+                "travel_distance_p95_km": supply_demand.get(
+                    "travel_distance_p95_km"
+                ),
+                "transfer_time_estimate_range_minutes": supply_demand.get(
+                    "transfer_time_estimate_range_minutes"
+                ),
+                "time_estimate_basis": supply_demand.get("time_estimate_basis"),
+                "planning_gaps": supply_demand.get("planning_gaps", []),
+                "excluded_facility_types": supply_demand.get(
+                    "excluded_facility_types", []
+                ),
+                "facility_utilization": supply_demand.get(
+                    "facility_utilization", []
+                ),
                 "equity_ledger": attrs.get("equity_ledger"),
+                "plan_scenarios": attrs.get("plan_scenarios", []),
             }
 
         if isinstance(attrs.get("decision_indices"), dict):
@@ -379,8 +442,16 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
                 structured["infrastructure_counts"]["affected_facilities"] = stats["affected_facilities"]
             if "affected_roads" in stats:
                 structured["infrastructure_counts"]["affected_roads"] = stats["affected_roads"]
+            if "unverified_surface_water_area_km2" in stats:
+                structured["unverified_surface_water_area_km2"] = stats[
+                    "unverified_surface_water_area_km2"
+                ]
             if "affected_bridges" in stats:
                 structured["infrastructure_counts"]["affected_bridges"] = stats["affected_bridges"]
+            if stats.get("extent_provenance") is not None:
+                structured["extent_provenance"] = stats["extent_provenance"]
+            if stats.get("extent_model") is not None:
+                structured["extent_model"] = stats["extent_model"]
             # Flood area (recomputed after clipping to the city boundary)
             flood_area = stats.get("flood_area_km2")
             if flood_area is not None and structured["flood_extent"] is None:
@@ -447,15 +518,14 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
         if isinstance(_temp, dict) and _temp.get("value") is not None:
             structured["temperature"] = _temp["value"]
 
-    # Population exposure backfill: fused population_exposure
-    # measurement (containing-tract Census population); used only if
-    # the structured path above left it unset.
-    if structured["population_exposure"] is None:
+    # Population context backfill: the containing-tract Census population is
+    # useful provenance/context but is not an affected-population estimate.
+    if structured["population_context"] is None:
         _pop = (structured.get("fused_measurements") or {}).get(
-            "population_exposure"
+            "containing_tract_population"
         )
         if isinstance(_pop, dict) and _pop.get("value") is not None:
-            structured["population_exposure"] = _pop["value"]
+            structured["population_context"] = _pop["value"]
 
     # Precipitation backfill: same source as temperature (fused
     # structured measurements). Skip probability fields (a percentage,
@@ -471,6 +541,84 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
                 )
                 break
 
+    # The accepted spatial object is the operational extent. A raw SAR
+    # observation or area-only statistic cannot promote itself to one.
+    accepted_extent = False
+    for obj in result.spatial_objects:
+        if obj.object_type != "flood_extent":
+            continue
+        geometry = obj.geometry or {}
+        if not isinstance(geometry, dict):
+            continue
+        if geometry.get("type") == "FeatureCollection":
+            if not geometry.get("features"):
+                continue
+        elif not geometry.get("coordinates"):
+            continue
+        accepted_extent = True
+        obj_attrs = obj.attributes or {}
+        obj_area = _safe_float(obj_attrs.get("flooded_area_km2"))
+        if obj_area is not None:
+            structured["flooded_area_km2"] = obj_area
+            structured["flood_extent"] = f"{obj_area} km²"
+        elif obj.geometry:
+            structured["flood_extent"] = "Detected"
+        structured["flood_extent_status"] = "detected"
+        structured["extent_provenance"] = (
+            obj_attrs.get("extent_provenance")
+            or structured.get("extent_provenance")
+        )
+        structured["extent_model"] = (
+            obj_attrs.get("model") or structured.get("extent_model")
+        )
+        structured["extent_confidence"] = (
+            obj_attrs.get("confidence")
+            if obj_attrs.get("confidence") is not None
+            else obj.confidence
+        )
+        structured["extent_timestamp"] = obj.timestamp
+        break
+    if not accepted_extent:
+        structured["flood_extent"] = None
+        structured["flooded_area_km2"] = None
+        structured["flood_extent_status"] = "not_detected"
+        structured["extent_provenance"] = None
+        structured["extent_model"] = None
+        structured["extent_confidence"] = None
+        structured["extent_timestamp"] = None
+
+    # Authoritative hydrologic classification is computed once in the
+    # backend from the station-specific NWPS thresholds.  The frontend only
+    # renders this result and never re-implements threshold logic.
+    stage = _safe_float(structured.get("water_level"))
+    categories = {
+        name: value
+        for name in ("action", "minor", "moderate", "major")
+        if (
+            value := _safe_float(structured.get(f"{name}_stage"))
+        ) is not None
+    }
+    if stage is not None and "action" in categories:
+        category = flood_category(stage, categories)
+        structured["hydrologic_category"] = category
+        ordered = ("action", "minor", "moderate", "major")
+        next_name = None
+        if category == "below_action":
+            next_name = "action"
+        elif category in ordered:
+            current_index = ordered.index(category)
+            for candidate in ordered[current_index + 1:]:
+                if candidate in categories:
+                    next_name = candidate
+                    break
+        if next_name is not None:
+            next_stage = categories[next_name]
+            structured["next_flood_threshold"] = {
+                "category": next_name,
+                "stage_ft": next_stage,
+                "margin_ft": round(next_stage - stage, 3),
+            }
+
     return structured
 
 # ---------------------------------------------------------------------
@@ -480,6 +628,7 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
 # never share HITL instances or equity contexts.
 _active_hitl: dict[str, "AdaptiveHITL"] = {}
 _equity_contexts: dict[str, dict] = {}
+_plan_contexts: dict[str, dict[str, str]] = {}
 _EQUITY_CONTEXT_LIMIT = 8   # the lambda slider only needs recent run contexts
 
 
@@ -487,7 +636,9 @@ def _remember_equity_context(run_id: str, context: dict) -> None:
     """Store equity-ledger context for the lambda/radius sliders, capped to bound growth."""
     _equity_contexts[run_id] = context
     while len(_equity_contexts) > _EQUITY_CONTEXT_LIMIT:
-        _equity_contexts.pop(next(iter(_equity_contexts)))
+        oldest = next(iter(_equity_contexts))
+        _equity_contexts.pop(oldest)
+        _plan_contexts.pop(oldest, None)
 
 
 def _latest_equity_context() -> dict | None:
@@ -594,6 +745,19 @@ def start_web_server():
                 break
         return {"status": "ok", "routed": routed}
     
+    @app.get("/api/validation")
+    async def historical_validation_status():
+        """Held-out historical validation declared in the manifest.
+
+        Surfaces the offline CLI result (scripts/validate_historical_events.py)
+        through the product so the claim is visible without running pytest.
+        """
+        try:
+            result = validate_manifest(load_default_manifest())
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {"status": "error", "reason": str(exc)}
+        return result
+
     @app.post("/api/assess")
     async def assess(req: AssessRequest):
         if mcp_manager is None and not req.demo:
@@ -738,9 +902,18 @@ def start_web_server():
                 _di_final = _ev.attributes["decision_indices"]
         _ws = _safe_float((_di_final.get("inputs") or {}).get("water_severity"))
         _issue_codes = {i.code for i in result.validation_issues}
-        active_hazard = bool(_ws and _ws > 0)
+        # A quiet gauge is not sufficient to dismiss a corroborated pluvial
+        # flood or an active official warning.  Use the same evidence set as
+        # the strategy gate rather than deriving UI state from CDRI's
+        # water-only hazard component.
+        active_hazard = bool(
+            (_ws is not None and _ws > 0)
+            or ((_safe_float(structured.get("flooded_area_km2")) or 0) > 0)
+            or ((_safe_float(structured.get("alert_count")) or 0) > 0)
+        )
         sar_contradiction = "SAR_EXTENT_STAGE_CONTRADICTION" in _issue_codes
         sar_implausible = "SAR_EXTENT_IMPLAUSIBLE" in _issue_codes
+        sar_uncorroborated = "SAR_EXTENT_UNCORROBORATED" in _issue_codes
 
         # Save the equity ledger context so the lambda slider can
         # recompute VWUN without rerunning the pipeline (keyed by
@@ -761,8 +934,6 @@ def start_web_server():
                 "frontier_equity_curve": opt_ledger.get(
                     "frontier_equity_curve", []
                 ),
-                # Needed for live radius recompute (demand records +
-                # recommended plan points)
                 "sensitivity_context": opt_ledger.get(
                     "sensitivity_context"
                 ),
@@ -776,6 +947,19 @@ def start_web_server():
                     if isinstance(entry, dict)
                 },
             })
+        scenarios = (
+            (structured.get("resource_optimization") or {}).get("plan_scenarios")
+            or []
+        )
+        _plan_contexts[run_id] = {
+            str(item["scenario_id"]): str(item["plan_id"])
+            for item in scenarios
+            if isinstance(item, dict)
+            and item.get("scenario_id")
+            and item.get("plan_id")
+        }
+        while len(_plan_contexts) > _EQUITY_CONTEXT_LIMIT:
+            _plan_contexts.pop(next(iter(_plan_contexts)))
 
         return {
             "run_id": run_id,
@@ -796,23 +980,36 @@ def start_web_server():
             "active_hazard": active_hazard,
             "sar_stage_contradiction": sar_contradiction,
             "sar_implausible": sar_implausible,
+            "sar_uncorroborated": sar_uncorroborated,
         }
+
+    @app.post("/api/plan-selection")
+    async def select_plan(payload: PlanSelectionRequest):
+        """Record an explicit human choice among generated plan profiles."""
+        allowed = _plan_contexts.get(payload.run_id)
+        if allowed is None:
+            raise HTTPException(status_code=404, detail="assessment run not found")
+        if allowed.get(payload.scenario_id) != payload.plan_id:
+            raise HTTPException(
+                status_code=400,
+                detail="scenario and plan do not match this assessment",
+            )
+        ExperimentLogger().log(
+            payload.run_id,
+            "plan_selection",
+            "human_plan_selected",
+            {
+                "scenario_id": payload.scenario_id,
+                "plan_id": payload.plan_id,
+                "selected_by": payload.selected_by[:80],
+                "note": payload.note[:500] if payload.note else None,
+            },
+        )
+        return {"status": "recorded", "plan_id": payload.plan_id}
 
     @app.post("/api/equity/sensitivity")
     async def equity_sensitivity(payload: dict):
-        """Recompute VWUN and the equity gap in real time as the caller
-        drags the lambda / coverage-radius sliders, without rerunning
-        the data pipeline.
-
-        Request: {"vulnerability_weight": 1.5}
-        Optional: {"run_id": "..."} (a run returned by /api/assess;
-                  fetches that exact run's ledger; falls back to the
-                  most recent run when omitted)
-                  {"equity_threshold": 0.9} (high-vulnerability cutoff)
-                  {"coverage_radius_km": 5} (facility coverage radius;
-                  shares social_good.demand_impacts_for_plan with
-                  flood_skill so numbers match the pipeline)
-        """
+        """Recompute equity metrics for a different vulnerability weight."""
         run_id = payload.get("run_id")
         equity = (
             _equity_contexts.get(run_id)
@@ -834,9 +1031,10 @@ def start_web_server():
             )
         from .social_good import (
             SocialGoodError,
+            compute_coverage_concentration_index_or_none,
             compute_equity_gap_or_none,
+            compute_normalized_vulnerability_weighted_unmet_need,
             compute_vulnerability_weighted_unmet_need,
-            demand_impacts_for_plan,
         )
 
         try:
@@ -854,89 +1052,67 @@ def start_web_server():
             )
         )
 
-        # Radius recompute: rebuild impacts from the run's saved
-        # sensitivity_context (demand records + frontier plan points)
-        radius_km = payload.get("coverage_radius_km")
         context = equity.get("sensitivity_context") or {}
         impacts = equity["demand_impacts"]
-        if radius_km is not None:
-            records = context.get("demand_records")
-            points = context.get("recommended_allocation_points")
-            if not records or not points:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "coverage-radius recompute requires "
-                        "sensitivity_context (records + allocation points) "
-                        "from a recent run."
-                    ),
-                )
-            try:
-                radius_km = float(radius_km)
-            except (TypeError, ValueError):
-                raise HTTPException(
-                    status_code=400, detail="invalid coverage_radius_km"
-                )
-            if not 0 < radius_km <= 50:
-                raise HTTPException(
-                    status_code=400,
-                    detail="coverage_radius_km must be within (0, 50]",
-                )
-            impacts = demand_impacts_for_plan(records, points, radius_km)
 
         try:
             vwun = compute_vulnerability_weighted_unmet_need(impacts, lam)
+            normalized_vwun = (
+                compute_normalized_vulnerability_weighted_unmet_need(
+                    impacts, lam
+                )
+            )
             gap, gap_note = compute_equity_gap_or_none(impacts, threshold)
+            concentration, concentration_note = (
+                compute_coverage_concentration_index_or_none(impacts)
+            )
         except SocialGoodError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
-        # Frontier preview: which plan would win the whole frontier
-        # under this lambda and radius.
-        # 1) Recompute per-frontier-plan VWUN at (lambda, R); VWUN
-        #    ordering depends on radius, not on lambda.
-        # 2) Re-inject the equity weight as base + lambda*popSVI,
-        #    renormalize, and rerun the weighted recommendation via the
-        #    same select_best_pareto_plan as the pipeline.
+        # Preview which already-computed frontier plan would win under this
+        # vulnerability weight. Assignment results are not recomputed.
         frontier_preview = None
         frontier_plans = context.get("frontier_plans") or []
         obj_defs = context.get("optimization_objectives") or []
-        weights_used = context.get("weights_used") or {}
+        base_weights = context.get("base_objective_weights") or {}
         pop_svi = context.get("population_weighted_svi")
-        lam_old = context.get("vulnerability_weight")
-        records = context.get("demand_records")
+        frontier_impacts = context.get("frontier_plan_impacts") or {}
         if (
             frontier_plans
             and obj_defs
-            and weights_used
+            and base_weights
             and pop_svi is not None
-            and lam_old is not None
-            and records
+            and frontier_impacts
         ):
             import copy
 
-            _radius = radius_km or context.get("coverage_radius_km") or 10.0
             per_plan = {}
+            normalized_per_plan = {}
             for fp in frontier_plans:
-                pts = fp.get("allocation_points") or []
-                if not pts:
+                _imp = frontier_impacts.get(str(fp.get("plan_id")))
+                if not _imp:
                     continue
                 try:
-                    _imp = demand_impacts_for_plan(records, pts, _radius)
                     per_plan[fp["plan_id"]] = round(
                         compute_vulnerability_weighted_unmet_need(_imp, lam),
                         2,
                     )
+                    normalized_per_plan[fp["plan_id"]] = round(
+                        compute_normalized_vulnerability_weighted_unmet_need(
+                            _imp, lam
+                        ),
+                        6,
+                    )
                 except (SocialGoodError, KeyError, ValueError):
                     continue
-            # Equity weight re-injection: base = old effective weight
-            # minus lam_old * pop_svi
-            _base_vc = float(
-                weights_used.get("vulnerability_coverage", 0.0)
-            ) - float(lam_old) * float(pop_svi)
-            _new_weights = dict(weights_used)
-            _new_weights["vulnerability_coverage"] = round(
-                max(0.0, _base_vc) + lam * float(pop_svi), 6
-            )
+            # Rebuild from the unnormalized configured weights. Subtracting
+            # λ from already-normalized weights changes their ratios.
+            _new_weights = dict(base_weights)
+            if any(o["name"] == "vulnerability_coverage" for o in obj_defs):
+                _new_weights["vulnerability_coverage"] = (
+                    float(base_weights.get("vulnerability_coverage", 0.0))
+                    + lam * float(pop_svi)
+                )
             _total = sum(
                 _new_weights.get(o["name"], 0.0) for o in obj_defs
             )
@@ -964,6 +1140,7 @@ def start_web_server():
                     would_recommend = None
             frontier_preview = {
                 "vwun_by_plan": per_plan,
+                "normalized_vwun_by_plan": normalized_per_plan,
                 "lowest_vwun_plan": (
                     min(per_plan, key=per_plan.get)
                     if per_plan
@@ -976,9 +1153,8 @@ def start_web_server():
                     != context.get("recommended_plan_id")
                 ),
                 "note": (
-                    "VWUN ranking across plans depends on coverage radius, "
-                    "not on lambda; the recommendation depends on lambda "
-                    "through the injected equity weight."
+                    "Uses each plan's existing capacity assignment; only the "
+                    "vulnerability weight changes."
                 ),
             }
 
@@ -986,10 +1162,16 @@ def start_web_server():
             "run_id": equity.get("run_id"),
             "vulnerability_weight": lam,
             "equity_threshold": threshold,
-            "coverage_radius_km": radius_km,
             "vulnerability_weighted_unmet_need": round(vwun, 2),
+            "normalized_vulnerability_weighted_unmet_need": round(
+                normalized_vwun, 6
+            ),
             "equity_gap": round(gap, 6) if gap is not None else None,
             "equity_gap_note": gap_note,
+            "coverage_concentration_index": (
+                round(concentration, 6) if concentration is not None else None
+            ),
+            "coverage_concentration_index_note": concentration_note,
             "demand_tract_count": len(impacts),
             "covered_tract_count": sum(
                 1 for d in impacts if d.get("coverage", 0) >= 1.0
@@ -1001,8 +1183,10 @@ def start_web_server():
                 "flooded fraction); equity_gap = mean coverage of "
                 "high-SVI tracts "
                 "minus low-SVI tracts (negative = most vulnerable "
-                "underserved). frontier_preview: which plan wins the "
-                "whole frontier at this lambda and radius."
+                "underserved); coverage_concentration_index uses continuous "
+                "population-weighted SVI ranks (positive = coverage favors "
+                "higher-SVI tracts). frontier_preview: which plan wins the "
+                "whole frontier at this lambda."
             ),
         }
 

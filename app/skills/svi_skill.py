@@ -119,6 +119,7 @@ class SviSkill:
                 "radius_km",
                 self.svi_radius_km,
             ),
+            "tract_scope": "search_radius",
             "profile": profile,
             # Tract details (with geometry) for affected-population estimation
             "tracts": tracts,
@@ -151,6 +152,7 @@ class SviSkill:
                 "dataset_year": vulnerability.get("dataset_year"),
                 "spatial_unit": vulnerability.get("spatial_unit"),
                 "radius_km": vulnerability.get("radius_km"),
+                "tract_scope": vulnerability.get("tract_scope"),
                 "tract_count": profile["tract_count"],
                 "excluded_tract_count": profile["excluded_tract_count"],
                 "total_population": profile["total_population"],
@@ -163,4 +165,3 @@ class SviSkill:
                 "coverage_completeness": profile["coverage_completeness"],
             },
         )
-

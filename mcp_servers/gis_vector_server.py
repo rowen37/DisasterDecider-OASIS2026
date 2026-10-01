@@ -26,6 +26,7 @@ from shapely.geometry import LineString, Point
 from mcp.server.fastmcp import FastMCP
 
 from overpass_client import OverpassError, post_overpass_sync
+from osm_labels import load_label_overrides, osm_display_label
 
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -44,7 +45,6 @@ TRAVEL_SPEED_MPS = {
     "walk": 4.0 / 3.6,
     "bike": 12.0 / 3.6,
 }
-
 
 def _json(payload: dict[str, Any]) -> str:
     """Serialize tool output consistently."""
@@ -509,6 +509,7 @@ def poi_search_osm(
     amenity_types: str,
     output_path: str = "",
     max_results: int = 100,
+    unlimited_results: bool = False,
 ) -> str:
     """
     Search OpenStreetMap amenity POIs through the public Overpass API.
@@ -562,12 +563,17 @@ def poi_search_osm(
                     f'  way["amenity"="{a}"](around:{r},{center_lat},{center_lon});'
                 )
 
+        output_clause = (
+            "out center;"
+            if unlimited_results
+            else f"out center {int(max_results)};"
+        )
         query = (
             '[out:json][timeout:30];\n'
             '(\n'
             + "\n".join(selectors) +
             '\n);\n'
-            f'out center {int(max_results)};\n'
+            f'{output_clause}\n'
         )
 
         # Shared Overpass client: mirror rotation + cooldown + TTL cache +
@@ -594,25 +600,29 @@ def poi_search_osm(
 
         features: list[dict[str, Any]] = []
         by_type: dict[str, int] = {}
+        label_overrides = load_label_overrides()
 
         for el in elements:
             tags = el.get("tags", {})
             amenity = tags.get("amenity") or (
                 "building" if "building" in tags else "unknown"
             )
-            # OSM legitimately has no `name` tag for many buildings and
-            # shelters.  Use a stable, traceable display label instead of the
-            # misleading word "Unnamed".
-            name = tags.get("name") or tags.get("operator") or (
-                f"{amenity.replace('_', ' ').title()} (OSM {el['id']})"
-            )
-
             if el.get("type") == "node":
                 lat, lon = el["lat"], el["lon"]
             elif el.get("type") in ("way", "relation") and "center" in el:
                 lat, lon = el["center"]["lat"], el["center"]["lon"]
             else:
                 continue
+
+            label = osm_display_label(
+                tags,
+                feature_type=amenity,
+                osm_type=el["type"],
+                osm_id=el["id"],
+                lat=float(lat),
+                lon=float(lon),
+                overrides=label_overrides,
+            )
 
             extra = {
                 k: v for k, v in tags.items()
@@ -625,7 +635,9 @@ def poi_search_osm(
                     "coordinates": [lon, lat],
                 },
                 "properties": {
-                    "name": name,
+                    "name": label["label"],
+                    "address": label["address"],
+                    "label_source": label["label_source"],
                     "amenity": amenity,
                     "osm_id": el["id"],
                     "osm_type": el["type"],
@@ -644,6 +656,8 @@ def poi_search_osm(
         feature_list = [
             {
                 "name": feature["properties"]["name"],
+                "address": feature["properties"].get("address"),
+                "label_source": feature["properties"].get("label_source"),
                 "amenity": feature["properties"]["amenity"],
                 "lat": feature["geometry"]["coordinates"][1],
                 "lon": feature["geometry"]["coordinates"][0],
@@ -658,6 +672,12 @@ def poi_search_osm(
             "feature_list": feature_list,
             "search_center": {"lat": center_lat, "lon": center_lon},
             "search_radius_m": radius_m,
+            "result_limit": None if unlimited_results else int(max_results),
+            "results_truncated": (
+                False
+                if unlimited_results
+                else len(features) >= int(max_results)
+            ),
             "_meta": {
                 "crs": WGS84,
                 "type": "point",

@@ -344,12 +344,21 @@ def normalize_fusion_observation(
     if isinstance(pop, dict) and not evidence_items:
         total = _safe_float(pop.get("total"))
         if total is not None:
+            population_role = str(
+                data.get("population_role")
+                or (
+                    "containing_tract_population"
+                    if data.get("census_geography")
+                    else "population_exposure"
+                )
+            )
             evidence_items.append({
                 **base,
                 "evidence_type": "measurement",
-                "variable": "population_exposure",
+                "variable": population_role,
                 "value": total,
                 "unit": pop.get("unit", "people"),
+                "semantics": data.get("note"),
             })
 
     # --------------------------------------------------------
@@ -776,4 +785,3 @@ def fuse_flood_evidence(
 
         "rejected_sources": rejected,
     }
-

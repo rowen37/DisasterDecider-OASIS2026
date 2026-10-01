@@ -10,9 +10,9 @@ component is perturbed by ±delta, producing:
     sensitivity   per-component one-at-a-time deviation from base
                   (larger = the composite depends more on it)
 
-This is a first-order approximation, NOT a probabilistic confidence
-interval (no distributional assumptions are made).  The ±10% default
-delta is a project convention.
+This is a what-if component stress test, NOT a probabilistic confidence
+interval (no distributional assumptions are made). The default delta is
+an absolute ±0.1 shift on each normalized component.
 """
 
 from __future__ import annotations
@@ -50,10 +50,9 @@ def component_band(
     base_value = compose(base_components)
     unconstrained = unconstrained or []
 
-    def _nz(x: float) -> float:
-        # Piecewise lower bound at zero (negatives clamp to 0), no upper
-        # truncation -- matches the index path's no-clamp convention.
-        return max(0.0, x)
+    def _bounded(x: float) -> float:
+        # The inputs to this stress test are normalized components.
+        return max(0.0, min(1.0, x))
 
     def _evaluate(overrides: dict[str, float]) -> float:
         merged = dict(base_components)
@@ -67,7 +66,7 @@ def component_band(
     for name, value in base_components.items():
         if name in unconstrained:
             # Missing component: bound over its full [0, 1] range
-            # (a ±10% perturbation is meaningless).
+            # (an absolute ±0.1 perturbation is meaningless).
             v_zero = _evaluate({name: 0.0})
             v_one = _evaluate({name: 1.0})
             sensitivity[name] = round(
@@ -76,8 +75,8 @@ def component_band(
             lo_candidates.extend([v_zero, v_one])
             hi_candidates.extend([v_zero, v_one])
             continue
-        plus = _nz(value + delta)
-        minus = _nz(value - delta)
+        plus = _bounded(value + delta)
+        minus = _bounded(value - delta)
         v_plus = _evaluate({name: plus})
         v_minus = _evaluate({name: minus})
         sensitivity[name] = round(
@@ -86,24 +85,25 @@ def component_band(
         lo_candidates.extend([v_plus, v_minus])
         hi_candidates.extend([v_plus, v_minus])
 
-    # Joint perturbation (conservative envelope): all components shifted ±delta together.
+    # Joint endpoint scenarios combine the full range of missing components
+    # with the ±delta changes of measured components. Treating them in
+    # separate runs can understate the upper scenario for a product index.
     joint_plus = _evaluate(
-        {k: _nz(v + delta) for k, v in base_components.items()}
+        {
+            k: 1.0 if k in unconstrained else _bounded(v + delta)
+            for k, v in base_components.items()
+        }
     )
     joint_minus = _evaluate(
-        {k: _nz(v - delta) for k, v in base_components.items()}
+        {
+            k: 0.0 if k in unconstrained else _bounded(v - delta)
+            for k, v in base_components.items()
+        }
     )
     lo_candidates.append(joint_minus)
     lo_candidates.append(joint_plus)
     hi_candidates.append(joint_minus)
     hi_candidates.append(joint_plus)
-
-    # Joint unconstrained: all missing components set to 0 / 1 together (joint extremes).
-    if unconstrained:
-        all_zero = _evaluate({k: 0.0 for k in unconstrained})
-        all_one = _evaluate({k: 1.0 for k in unconstrained})
-        lo_candidates.extend([all_zero, all_one])
-        hi_candidates.extend([all_zero, all_one])
 
     lo = min(lo_candidates)
     hi = max(hi_candidates)

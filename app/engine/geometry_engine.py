@@ -28,6 +28,18 @@ class ClipResult:
     city_boundary_geom: Any = None
 
 
+@dataclass
+class StageBufferResult:
+    """Outcome of the modeled stage-buffer flood extent."""
+
+    geojson: dict[str, Any]
+    area_km2: float
+    union_geom: Any
+    # Full audit of the model inputs and radius policy so the map can
+    # disclose exactly how the extent was produced.
+    model: dict[str, Any]
+
+
 class GeometryEngine:
     """Pure spatial computation: geometries in, geometries and numbers out."""
 
@@ -121,6 +133,241 @@ class GeometryEngine:
             flood_union_geom=clipped_union,
             polygon_count=len(clipped_geoms),
             city_boundary_geom=city_geom,
+        )
+
+    def build_stage_buffer_extent(
+        self,
+        *,
+        waterways: list[dict[str, Any]],
+        peak_stage_ft: float | None,
+        action_stage_ft: float | None,
+        minor_stage_ft: float | None = None,
+        moderate_stage_ft: float | None = None,
+        base_km: float = 0.15,
+        minor_km: float = 0.4,
+        moderate_km: float = 0.8,
+        max_km: float = 1.5,
+        anchor: tuple[float, float] | None = None,
+        max_waterways: int = 5,
+        stream_fraction: float = 0.4,
+        max_corridor_km: float = 10.0,
+    ) -> StageBufferResult | None:
+        """First-order hydraulic-proximity flood extent.
+
+        Buffers the OSM waterway network by a radius that scales with
+        the gauge peak's exceedance above action stage, piecewise-anchored
+        at the NWPS minor/moderate categories:
+
+            exceedance 0       -> base_km
+            minor - action     -> minor_km
+            moderate - action  -> moderate_km   (linear between anchors,
+                                                extrapolated beyond,
+                                                capped at max_km)
+
+        The gauge measures ONE river: with an ``anchor`` (station
+        coordinates) only the few nearest waterways are buffered (the
+        gauged main stem plus immediate confluences), and streams get a
+        reduced radius (``stream_fraction``) versus rivers/canals --
+        a stage reading on the Saddle River must not flood every brook
+        within 15 km.
+
+        This is a disclosed PLANNING HEURISTIC, not hydraulics: it exists
+        so that a gauge-confirmed flood still gets a spatial picture
+        (map, exposure, routes) when satellite imagery is missing or
+        mistimed. It deliberately over-includes within the gauged
+        corridor because the operational cost of a missed flood exceeds
+        the cost of an over-wide advisory polygon. Without minor/moderate
+        anchors the radius falls back to ``base_km * (1 + exceedance_ft)``
+        capped at ``max_km``.
+
+        Returns None when there is nothing to model (no positive
+        exceedance or no usable waterway geometry).
+        """
+        peak = _safe_float(peak_stage_ft)
+        action = _safe_float(action_stage_ft)
+        minor = _safe_float(minor_stage_ft)
+        moderate = _safe_float(moderate_stage_ft)
+        if peak is None or action is None or peak <= action:
+            return None
+
+        exceedance_ft = peak - action
+
+        def _interp(
+            x: float, x0: float, y0: float,
+            x1: float, y1: float, clamp: bool = True,
+        ) -> float:
+            if x1 <= x0:
+                return y1
+            t = (x - x0) / (x1 - x0)
+            if clamp:
+                t = min(1.0, max(0.0, t))
+            return y0 + t * (y1 - y0)
+
+        if minor is not None and minor > action:
+            radius_km = _interp(exceedance_ft, 0.0, base_km,
+                                minor - action, minor_km)
+            if moderate is not None and moderate > minor:
+                if exceedance_ft > minor - action:
+                    # Beyond moderate, keep the minor->moderate slope
+                    # (unclamped extrapolation); the max_km cap below is
+                    # the only ceiling.
+                    radius_km = _interp(
+                        exceedance_ft, minor - action, minor_km,
+                        moderate - action, moderate_km, clamp=False,
+                    )
+            radius_basis = "nwps_category_anchored"
+        else:
+            radius_km = base_km * (1.0 + exceedance_ft)
+            radius_basis = "linear_fallback_no_minor_anchor"
+        radius_km = round(min(max_km, radius_km), 3)
+
+        from shapely.geometry import LineString as _ShpLineString
+
+        def _way_distance_km(way: dict[str, Any]) -> float:
+            # Min great-circle distance from the anchor to the way's
+            # vertices (kilometers); infinity when unparseable.
+            coords = way.get("coordinates") or []
+            best = float("inf")
+            for p in coords:
+                try:
+                    lon, lat = float(p[0]), float(p[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                dlon = math.radians(lon - anchor[1])
+                dlat = math.radians(lat - anchor[0])
+                a = (
+                    math.sin(dlat / 2) ** 2
+                    + math.cos(math.radians(anchor[0]))
+                    * math.cos(math.radians(lat))
+                    * math.sin(dlon / 2) ** 2
+                )
+                best = min(best, 6371.0 * 2 * math.asin(math.sqrt(a)))
+            return best
+
+        candidates = [
+            w for w in waterways or []
+            if isinstance(w, dict)
+            and isinstance(w.get("coordinates"), list)
+            and len(w["coordinates"]) >= 2
+        ]
+        selected = candidates
+        selection_basis = "all_waterways"
+        if anchor is not None:
+            # The gauge measures one river: keep only waterways within
+            # the corridor around the station, nearest first (main stem
+            # + immediate confluences). Everything else in a dense
+            # urban search radius is un-gauged territory the stage
+            # reading says nothing about.
+            ranked = sorted(
+                (
+                    (_way_distance_km(w), w) for w in candidates
+                ),
+                key=lambda pair: pair[0],
+            )
+            in_corridor = [
+                w for d, w in ranked
+                if d <= max_corridor_km
+            ][: max(1, max_waterways)]
+            selected = in_corridor or [
+                w for _, w in ranked[: max(1, max_waterways)]
+            ]
+            selection_basis = "nearest_to_gauge"
+
+        lines = []
+        for way in selected:
+            coords = way["coordinates"]
+            try:
+                line = _ShpLineString(
+                    [(float(p[0]), float(p[1])) for p in coords]
+                )
+                if not line.is_empty:
+                    lines.append((way, line))
+            except (TypeError, ValueError):
+                continue
+        if not lines:
+            return None
+
+        from shapely.ops import unary_union as _shp_union
+
+        # Buffer in the equal-area CRS so the radius is true meters.
+        # Rivers/canals carry the full exceedance-scaled radius; streams
+        # a reduced fraction (a stage on the main stem propagates far
+        # less up tiny tributaries).
+        projected = []
+        for way, line in lines:
+            p = self._equal_area(line)
+            if p is None or p.is_empty:
+                continue
+            way_radius = radius_km
+            if str(way.get("waterway") or "").lower() == "stream":
+                way_radius = radius_km * stream_fraction
+            projected.append((way_radius, p))
+        if not projected:
+            return None
+        buffered = [
+            p.buffer(r_km * 1000.0) for r_km, p in projected
+        ]
+        union = _shp_union(buffered)
+        if union is None or union.is_empty:
+            return None
+
+        # Back to WGS84 for GeoJSON; area from the equal-area union.
+        try:
+            from pyproj import Transformer as _Transformer
+            from shapely.ops import transform as _shp_transform
+
+            _inv = _Transformer.from_crs(
+                "EPSG:6933", "EPSG:4326", always_xy=True
+            ).transform
+            wgs84_union = _shp_transform(
+                lambda x, y, z=None: _inv(x, y), union
+            )
+        except Exception:
+            return None
+
+        import geopandas as gpd
+
+        area_km2 = float(union.area) / 1e6
+        gdf = gpd.GeoDataFrame(geometry=[wgs84_union], crs="EPSG:4326")
+        geojson = json.loads(gdf.to_json(drop_id=True))
+
+        model = {
+            "method": "stage_buffer",
+            "radius_km": radius_km,
+            "radius_basis": radius_basis,
+            "waterway_selection": selection_basis,
+            "stream_radius_fraction": stream_fraction,
+            "peak_stage_ft": peak,
+            "action_stage_ft": action,
+            "minor_stage_ft": minor,
+            "moderate_stage_ft": moderate,
+            "exceedance_ft": round(exceedance_ft, 3),
+            "waterway_count": len(lines),
+            "selected_waterways": [
+                {
+                    "name": way.get("name"),
+                    "type": way.get("waterway"),
+                }
+                for way, _ in lines
+            ],
+            "buffer_params_km": {
+                "base": base_km, "minor": minor_km,
+                "moderate": moderate_km, "max": max_km,
+            },
+            "semantics": (
+                "First-order hydraulic-proximity model: the waterways "
+                "nearest the gauge buffered by a stage-exceedance-"
+                "scaled radius (streams at a reduced fraction). NOT "
+                "observed inundation and NOT a hydraulic simulation; "
+                "deliberately over-inclusive within the gauged "
+                "corridor (advisory posture)."
+            ),
+        }
+        return StageBufferResult(
+            geojson=geojson,
+            area_km2=round(area_km2, 4),
+            union_geom=wgs84_union,
+            model=model,
         )
 
     def filter_tracts_to_boundary(
@@ -270,12 +517,10 @@ class GeometryEngine:
             flooded_fraction     flood area ∩ tract area / tract area (equal-area projection)
             exposed_population   population × flooded_fraction
             svi                  passed through as-is (None if missing)
-        Falls back to centroid containment (fraction ∈ {0, 1}) when the
-        tract geometry is unusable, and says so in the method field --
-        no fabricated intermediate precision.
+        If a tract geometry cannot support an area ratio, that tract is
+        marked unavailable. It is never promoted to whole-tract exposure
+        merely because a centroid falls inside the flood polygon.
         """
-        from shapely.geometry import Point as _ShpPoint
-
         records: list[dict[str, Any]] = []
         for tract in social_vulnerability.get("tracts", []):
             pop = _safe_float(tract.get("population"))
@@ -298,14 +543,8 @@ class GeometryEngine:
                         inter.area / denom if denom > 0 else 0.0
                     )
                 else:
-                    # Projection failed: fall back to centroid containment and flag it
-                    method = "centroid_fallback"
-                    centroid = poly.centroid
-                    fraction = (
-                        1.0
-                        if flood_union_geom.contains(centroid)
-                        else 0.0
-                    )
+                    method = "unavailable_area_ratio"
+                    fraction = None
                 # Centroid exposure recorded separately: the other end of
                 # the affected-population method bracket.
                 try:
@@ -315,44 +554,25 @@ class GeometryEngine:
                 except Exception:
                     centroid_exposed = None
             else:
-                method = "centroid_fallback"
-                geometry = tract.get("geometry") or {}
-                rings = (
-                    geometry.get("rings")
-                    if isinstance(geometry, dict)
-                    else None
-                )
-                centroid = None
-                if isinstance(rings, list) and rings:
-                    ring = rings[0]
-                    if (
-                        isinstance(ring, list)
-                        and len(ring) >= 3
-                        and all(
-                            isinstance(pt, (list, tuple)) and len(pt) >= 2
-                            for pt in ring[:3]
-                        )
-                    ):
-                        xs = [pt[0] for pt in ring]
-                        ys = [pt[1] for pt in ring]
-                        centroid = _ShpPoint(
-                            sum(xs) / len(xs), sum(ys) / len(ys)
-                        )
-                fraction = (
-                    1.0
-                    if centroid is not None
-                    and flood_union_geom.contains(centroid)
-                    else 0.0
-                )
-                centroid_exposed = fraction >= 1.0
+                method = "unavailable_area_ratio"
+                fraction = None
+                centroid_exposed = None
 
-            exposed = pop * fraction if pop is not None else None
+            exposed = (
+                pop * fraction
+                if pop is not None and fraction is not None
+                else None
+            )
             records.append(
                 {
                     "tract_id": tract.get("tract_id"),
                     "population": pop,
                     "svi": svi,
-                    "flooded_fraction": round(fraction, 6),
+                    "flooded_fraction": (
+                        round(fraction, 6)
+                        if fraction is not None
+                        else None
+                    ),
                     "exposed_population": (
                         round(exposed, 2) if exposed is not None else None
                     ),
@@ -404,33 +624,80 @@ class GeometryEngine:
         self,
         flood_union_geom: Any,
         social_vulnerability: dict[str, Any],
-    ) -> tuple[float, int, str]:
+    ) -> tuple[float | None, int, str]:
         """
         Area-weighted affected population:
         population × (flood ∩ tract area / tract area).
 
-        The equal-area projection (EPSG:6933) keeps area ratios correct;
-        tracts without usable geometry fall back to centroid containment.
-        Unlike centroid counting (whole tract counted when its centroid
-        is flooded), this avoids systematic overestimation for small
-        floods inside large tracts.
+        The equal-area projection (EPSG:6933) keeps area ratios correct.
+        Tracts without usable geometry make this tract-level estimate
+        unavailable instead of triggering whole-tract centroid counting.
 
         Returns (affected population, affected tract count, method label).
         """
         records = self.tract_exposure(flood_union_geom, social_vulnerability)
+        populated_records = [
+            record
+            for record in records
+            if record.get("population") is not None
+        ]
+        if not populated_records:
+            return None, 0, "unavailable_area_ratio"
+        if any(
+            record.get("exposed_population") is None
+            for record in populated_records
+        ):
+            return None, 0, "unavailable_area_ratio"
         affected_pop = 0.0
         affected_tracts = 0
-        methods = {r["method"] for r in records}
-        for record in records:
+        for record in populated_records:
             exposed = record.get("exposed_population")
             if exposed is None:
                 continue
             affected_pop += exposed
             if record.get("flooded_fraction", 0.0) > 0.0:
                 affected_tracts += 1
-        method = (
-            "areal_weighted"
-            if methods == {"areal_weighted"}
-            else "areal_weighted_with_centroid_fallback"
-        )
-        return affected_pop, affected_tracts, method
+        return affected_pop, affected_tracts, "areal_weighted"
+
+    @staticmethod
+    def estimate_uniform_density_population(
+        total_population: Any,
+        flooded_area_km2: Any,
+        analysis_area_km2: Any,
+    ) -> float | None:
+        """Coarse fallback using one population density for the same scope."""
+        population = _safe_float(total_population)
+        flooded_area = _safe_float(flooded_area_km2)
+        analysis_area = _safe_float(analysis_area_km2)
+        if (
+            population is None
+            or population < 0
+            or flooded_area is None
+            or flooded_area < 0
+            or analysis_area is None
+            or analysis_area <= 0
+        ):
+            return None
+        return population * min(flooded_area / analysis_area, 1.0)
+
+    @staticmethod
+    def count_facilities_in_extent(
+        flood_union_geom: Any,
+        facilities: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Count flooded and locatable facilities from the same inventory."""
+        from shapely.geometry import Point
+
+        affected = 0
+        locatable = 0
+        for facility in facilities:
+            if not isinstance(facility, dict):
+                continue
+            lat = _safe_float(facility.get("latitude"))
+            lon = _safe_float(facility.get("longitude"))
+            if lat is None or lon is None:
+                continue
+            locatable += 1
+            if flood_union_geom.covers(Point(lon, lat)):
+                affected += 1
+        return affected, locatable
