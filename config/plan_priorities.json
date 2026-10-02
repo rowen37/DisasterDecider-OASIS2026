@@ -28,6 +28,12 @@
       ]
     },
     {
+      "id": "community_compatible",
+      "label": "Community-compatible plan",
+      "description": "Among existing Pareto plans, prefers sourced facility capabilities that match the selected community requirements. Unknown capability data remains visible.",
+      "selector": "community_compatible"
+    },
+    {
       "id": "shorter_transfer",
       "label": "Shorter transfer",
       "description": "Chooses the candidate with the shortest p95 assignment distance.",

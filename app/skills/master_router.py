@@ -50,7 +50,7 @@ class MasterRouter:
             raise ValueError(f"Unsupported hazard type: {hazard}")
 
         patterns = [
-            r"(?:near|around|in)\s+([A-Za-z,\s]+?)(?=\s+using|\s+station|\s+USGS|\s+with|\s+for|\s+and|\s+via|\s+based|[.!?]|$)",
+            r"(?:near|around|in)\s+([A-Za-z,\s]+?)(?=\s+using|\s+station|\s+USGS|\s+with|\s+for|\s+and|\s+via|\s+based|\s+flooding\b|\s+flooded\b|\s+right\s+now\b|\s+currently\b|\s+today\b|[.!?]|$)",
             r"(?:near|around|in)\s+(.+?)(?:[.!?]|$)",
             # Three-part form: "<hazard> <place> [<station>]", e.g.
             # "flood Manhattan Kansas 06887000" / "flood Manhattan"
@@ -62,7 +62,8 @@ class MasterRouter:
         ]
         _CUTOFF_WORDS = {
             "using", "with", "for", "and", "via",
-            "based", "station", "usgs", "id",
+            "based", "station", "usgs", "id", "flooding",
+            "flooded", "currently", "today", "now",
         }
 
         for pattern in patterns:

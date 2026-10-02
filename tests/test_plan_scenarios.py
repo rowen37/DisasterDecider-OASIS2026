@@ -43,4 +43,41 @@ def test_profiles_are_maintained_in_config():
         "coverage_first",
         "vulnerability_first",
         "shorter_transfer",
+        "community_compatible",
+    }
+
+
+def test_community_profile_prefers_sourced_match_within_frontier():
+    curve = [
+        {
+            "plan_id": "unknown",
+            "served_people": 100,
+            "unmet_people": 0,
+            "cost": 5,
+            "community_requirements_total": 2,
+            "community_requirements_met": 0,
+            "community_unmet_count": 0,
+            "community_unknown_count": 2,
+        },
+        {
+            "plan_id": "matched",
+            "served_people": 90,
+            "unmet_people": 10,
+            "cost": 10,
+            "community_requirements_total": 2,
+            "community_requirements_met": 2,
+            "community_unmet_count": 0,
+            "community_unknown_count": 0,
+        },
+    ]
+    scenarios = build_plan_scenarios(curve, "unknown")
+    selected = {item["scenario_id"]: item["plan_id"] for item in scenarios}
+    assert selected["community_compatible"] == "matched"
+
+
+def test_community_profile_is_hidden_without_event_requirements():
+    curve = [{"plan_id": "p1", "community_requirements_total": 0}]
+    scenarios = build_plan_scenarios(curve, "p1")
+    assert "community_compatible" not in {
+        item["scenario_id"] for item in scenarios
     }

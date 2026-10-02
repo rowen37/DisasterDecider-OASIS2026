@@ -15,7 +15,11 @@ from typing import Any
 from app.evidence_quality import assess_observation_quality
 
 from ..experiment import ExperimentLogger
-from ..utils import safe_float as _safe_float, utc_now
+from ..community import (
+    annotate_plan_community,
+    normalize_community_requirements,
+)
+from ..utils import geodesic_km, safe_float as _safe_float, utc_now
 from .fusion import (
     _load_json_env,
 )
@@ -432,9 +436,13 @@ threshold or validated model is present in the evidence.
         self.gis_search_radius_buildings_m = float(
             os.getenv("GIS_SEARCH_RADIUS_BUILDINGS_M", "3000")
         )
-        # Road-network search radius for detour routes
-        self.gis_route_search_radius_km = float(
-            os.getenv("GIS_ROUTE_SEARCH_RADIUS_KM", "10")
+        # Half-widths for a target-to-facility road corridor. These do not
+        # change the separate 15/30 km facility service-area policy.
+        self.gis_route_corridor_km = float(
+            os.getenv("GIS_ROUTE_CORRIDOR_KM", "2")
+        )
+        self.gis_route_expanded_corridor_km = float(
+            os.getenv("GIS_ROUTE_EXPANDED_CORRIDOR_KM", "4")
         )
         self.gis_route_avoid_flood = (
             os.getenv("GIS_ROUTE_AVOID_FLOOD", "true").lower() == "true"
@@ -545,6 +553,9 @@ threshold or validated model is present in the evidence.
         self.equity_threshold = float(
             os.environ["EQUITY_HIGH_VULNERABILITY_THRESHOLD"]
         )
+        self.community_requirements: list[str] = []
+        self.community_source: str | None = None
+        self.community_note: str | None = None
 
         # -- Four-layer decoupling assembly -------------------------
         # Engine: pure resource-allocation computation (objectives /
@@ -850,6 +861,9 @@ threshold or validated model is present in the evidence.
                 "plan_scenarios": optimization.get(
                     "plan_scenarios", []
                 ),
+                "community_input": optimization.get(
+                    "community_input"
+                ),
                 "objectives": (
                     self.allocation_objectives
                 ),
@@ -876,6 +890,18 @@ threshold or validated model is present in the evidence.
                 self.vulnerability_weight = float(overrides['vulnerability_weight'])
             if 'equity_threshold' in overrides:
                 self.equity_threshold = float(overrides['equity_threshold'])
+            if 'community_requirements' in overrides:
+                self.community_requirements = normalize_community_requirements(
+                    overrides['community_requirements']
+                )
+            if 'community_source' in overrides:
+                self.community_source = str(
+                    overrides['community_source'] or ""
+                ).strip()[:120] or None
+            if 'community_note' in overrides:
+                self.community_note = str(
+                    overrides['community_note'] or ""
+                ).strip()[:500] or None
             if 'event_date' in overrides and overrides['event_date']:
                 _ed = str(overrides['event_date']).strip()
                 # Accept only YYYY-MM-DD; keeps arbitrary strings out of MCP arguments
@@ -1284,25 +1310,56 @@ threshold or validated model is present in the evidence.
                     location_verified=station_location_verified,
                 )
 
-                # Distance exceeded: the station was explicitly chosen,
-                # so continue with a warning instead of failing outright
-                # (residual geocoding ambiguity or a multi-station
-                # network); the audit trail records it and the resource
-                # gate reads the real value.
+                # A distant station cannot be combined with target-local
+                # SAR, weather, population, or infrastructure evidence.
+                # Stop before fusion and risk computation rather than
+                # manufacturing a cross-city assessment.
                 if not spatial_verification.passed:
                     validation_issues.append(
                         ValidationIssue(
-                            severity="warning",
+                            severity="error",
                             code="STATION_TARGET_DISTANCE_EXCEEDED",
                             message=(
                                 f"Station is {station_distance_km:.1f} km "
                                 f"from the geocoded target (max "
                                 f"{self.station_max_distance_km} km); "
-                                "the pairing may be wrong — verify the "
-                                "station serves this location."
+                                "risk computation was blocked because "
+                                "the target/station pairing is invalid."
                             ),
                             field="station_target_distance",
                         )
+                    )
+                    self.state.log(
+                        "assessment_blocked_invalid_station_pairing",
+                        target=target,
+                        station_id=verified_station_id,
+                        distance_km=station_distance_km,
+                        max_allowed_distance_km=(
+                            self.station_max_distance_km
+                        ),
+                    )
+                    return SkillResult(
+                        status="error",
+                        summary=(
+                            "Flood assessment blocked before evidence "
+                            "fusion and risk computation: USGS station "
+                            f"{verified_station_id} is "
+                            f"{station_distance_km:.1f} km from the "
+                            f"geocoded target {target}, exceeding the "
+                            f"{self.station_max_distance_km:.1f} km "
+                            "pairing limit."
+                        ),
+                        evidence=[],
+                        spatial_objects=list(
+                            self.state.spatial_objects.values()
+                        ),
+                        validation_issues=validation_issues,
+                        next_actions=[
+                            "Choose a USGS gauge that serves the target "
+                            "area, or correct the target place name.",
+                            "Re-run only after the target/station "
+                            "distance passes verification.",
+                        ],
                     )
             else:
                 station_distance_km = None
@@ -1467,6 +1524,24 @@ threshold or validated model is present in the evidence.
                     )
                     fused_evidence = fuse_flood_evidence(fusion_observations, log=self.state.log)
 
+                    for rejected in fused_evidence.get(
+                        "rejected_sources", []
+                    ):
+                        if rejected.get("source_type") != "satellite_sar":
+                            continue
+                        validation_issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                code="SAR_EXTENT_UNAVAILABLE",
+                                message=(
+                                    "No usable SAR flood extent was "
+                                    "available: "
+                                    f"{rejected.get('error', 'source failed')}."
+                                ),
+                                field="flood_inundation_extent",
+                            )
+                        )
+
                     # -- Time-alignment ledger: per-source offsets and
                     # mismatch disclosure. Historical mode already skips
                     # current-only sources at collection; re-check the
@@ -1574,6 +1649,28 @@ threshold or validated model is present in the evidence.
                     )
 
                     if escalate:
+                        for variable, fused in (
+                            fused_evidence.get(
+                                "fused_measurements", {}
+                            ).items()
+                        ):
+                            if not fused.get("conflict"):
+                                continue
+                            validation_issues.append(
+                                ValidationIssue(
+                                    severity="warning",
+                                    code="MULTI_SOURCE_CONFLICT",
+                                    message=(
+                                        "Multi-source conflict for "
+                                        f"{variable}: source values "
+                                        f"{fused.get('source_values', {})} "
+                                        "exceeded the configured conflict "
+                                        "threshold; unattended resource "
+                                        "optimization was blocked."
+                                    ),
+                                    field=variable,
+                                )
+                            )
                         self.state.log(
                             "hitl_escalation",
                             reason=escalate_reason,
@@ -2733,41 +2830,60 @@ threshold or validated model is present in the evidence.
                         if poi_path and features:
                             gis_results["poi_path"] = poi_path
                             if features and isinstance(features, list) and len(features) > 0:
-                                dest = features[0]
+                                valid_destinations = [
+                                    feature for feature in features
+                                    if isinstance(feature, dict)
+                                    and _safe_float(feature.get("lat")) is not None
+                                    and _safe_float(feature.get("lon")) is not None
+                                ]
+                                dest = min(
+                                    valid_destinations,
+                                    key=lambda feature: geodesic_km(
+                                        location.latitude,
+                                        location.longitude,
+                                        float(feature["lat"]),
+                                        float(feature["lon"]),
+                                    ),
+                                ) if valid_destinations else None
                                 if isinstance(dest, dict):
+                                    selected_distance_km = geodesic_km(
+                                        location.latitude,
+                                        location.longitude,
+                                        float(dest["lat"]),
+                                        float(dest["lon"]),
+                                    )
+                                    stats["route_destination_name"] = dest.get("name")
+                                    stats["route_destination_distance_km"] = round(
+                                        selected_distance_km, 2
+                                    )
+                                    stats["route_destination_policy"] = (
+                                        "nearest_returned_hospital_or_shelter"
+                                    )
                                     route_args = {
                                         "origin_lat": location.latitude,
                                         "origin_lon": location.longitude,
                                         "dest_lat": dest.get("lat"),
                                         "dest_lon": dest.get("lon"),
                                         "travel_mode": "drive",
-                                        "search_radius_km": self.gis_route_search_radius_km,
+                                        "search_radius_km": self.gis_route_corridor_km,
+                                        "expanded_search_radius_km": (
+                                            self.gis_route_expanded_corridor_km
+                                        ),
                                     }
                                     if self.gis_route_avoid_flood:
                                         route_args["avoid_polygon_path"] = flood_boundary_path
-                                    route_result = await self.mcp.call("vec_shortest_path", route_args)
-                                    route_data = json.loads(route_result)
-                                    # If flooding cuts the path, fall back
-                                    # to a non-avoiding route as an
-                                    # accessibility reference (explicitly
-                                    # marked as not avoiding flood)
-                                    route_err = (
-                                        route_data.get("error")
-                                        if isinstance(route_data, dict)
-                                        else None
+                                    route_result = await self.mcp.call(
+                                        "vec_shortest_path",
+                                        route_args,
+                                        # One bounded call. The tool may make
+                                        # two 20 s downloads (mirror fallback
+                                        # or 2 km then 4 km) but never gets an
+                                        # outer retry that queues another
+                                        # synchronous OSMnx download.
+                                        timeout=45.0,
+                                        max_retries=1,
                                     )
-                                    if route_err and "no_path" in str(route_err).lower():
-                                        route_result = await self.mcp.call("vec_shortest_path", {
-                                            "origin_lat": location.latitude,
-                                            "origin_lon": location.longitude,
-                                            "dest_lat": dest.get("lat"),
-                                            "dest_lon": dest.get("lon"),
-                                            "travel_mode": "drive",
-                                            "search_radius_km": self.gis_route_search_radius_km,
-                                        })
-                                        route_data = json.loads(route_result)
-                                        if isinstance(route_data, dict) and not route_data.get("error"):
-                                            gis_results["stats"]["route_avoids_flood"] = False
+                                    route_data = json.loads(route_result)
                                     if (
                                         not _record_gis_tool_error(
                                             route_data, "vec_shortest_path"
@@ -2777,6 +2893,12 @@ threshold or validated model is present in the evidence.
                                         route_path = route_data.get("output_path")
                                         if route_path:
                                             gis_results["rescue_route_path"] = route_path
+                                            gis_results["stats"]["route_avoids_flood"] = (
+                                                route_data.get("route_avoids_flood")
+                                            )
+                                            gis_results["stats"]["route_corridor_half_width_km"] = (
+                                                route_data.get("corridor_half_width_km")
+                                            )
                                             gis_results["stats"]["route_length_km"] = route_data.get("path_length_km", 0)
                                             gis_results["stats"]["travel_time_min"] = route_data.get("travel_time_min", 0)
                                             # Flooded road segments = edges removed from the routing graph
@@ -3357,6 +3479,19 @@ threshold or validated model is present in the evidence.
                         demand_records=_demand_records,
                         vulnerability_weight=self.vulnerability_weight,
                     )
+                    annotate_plan_community(
+                        plans,
+                        self.community_requirements,
+                        source=self.community_source,
+                        note=self.community_note,
+                    )
+                    self.state.log(
+                        "community_requirements_applied",
+                        requirements=self.community_requirements,
+                        source=self.community_source,
+                        live_feed_used=False,
+                        candidate_plan_count=len(plans),
+                    )
 
                     # -- SVI influences Pareto weights: when SVI is
                     # available, add vulnerability_weight dynamically on
@@ -3570,8 +3705,32 @@ threshold or validated model is present in the evidence.
                                     "planning_gaps": (
                                         plan_supply.get("planning_gaps") or []
                                     ),
+                                    "community_summary": plan.get(
+                                        "community_summary"
+                                    ),
+                                    "community_requirements_met": plan.get(
+                                        "community_requirements_met", 0
+                                    ),
+                                    "community_requirements_total": plan.get(
+                                        "community_requirements_total", 0
+                                    ),
+                                    "community_unmet_count": plan.get(
+                                        "community_unmet_count", 0
+                                    ),
+                                    "community_unknown_count": plan.get(
+                                        "community_unknown_count", 0
+                                    ),
+                                    "community_fit": plan.get(
+                                        "community_fit"
+                                    ),
                                 }
                             )
+                        optimization["community_input"] = {
+                            "requirements": self.community_requirements,
+                            "source": self.community_source,
+                            "note": self.community_note,
+                            "live_feed_used": False,
+                        }
                         optimization["frontier_equity_curve"] = equity_curve
                         optimization["plan_scenarios"] = build_plan_scenarios(
                             equity_curve,
@@ -3934,6 +4093,19 @@ threshold or validated model is present in the evidence.
                 next_actions.append(
                     "Validate the recommended allocation against operational constraints before dispatch."
                 )
+            elif (
+                isinstance(optimization, dict)
+                and optimization.get("status")
+                == "blocked_by_evidence_gate"
+            ):
+                next_actions.append(
+                    "Resource optimization was blocked by the evidence/HITL "
+                    "gate: "
+                    + "; ".join(
+                        str(reason)
+                        for reason in optimization.get("reasons", [])
+                    )
+                )
             elif self.resource_tool:
                 next_actions.append(
                     "Resource discovery succeeded but no feasible allocation plan was found. Check resource availability."
@@ -3943,7 +4115,12 @@ threshold or validated model is present in the evidence.
                     "Configure RESOURCE_DISCOVERY_TOOL and objectives to enable Pareto optimization."
                 )
 
-            if freshness_seconds is not None:
+            if self.historical_mode:
+                # Historical evidence is validated against the event
+                # window above.  Wall-clock age is expected and must not
+                # be presented as an operational freshness problem.
+                pass
+            elif freshness_seconds is not None:
                 next_actions.append(
                     f"Check observation freshness ({freshness_seconds:.0f}s) against your operational policy."
                 )

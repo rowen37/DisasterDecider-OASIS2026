@@ -204,6 +204,7 @@ async def _fetch_osm_facilities(
         )
         facilities.append(
             {
+                "facility_id": f"osm:{el.get('type', 'element')}:{el.get('id')}",
                 "kind": kind,
                 "name": label["label"],
                 "address": label["address"],
@@ -215,7 +216,11 @@ async def _fetch_osm_facilities(
                 ),
                 "tags": {
                     k: tags[k]
-                    for k in ("beds", "capacity", "ambulances", "phone")
+                    for k in (
+                        "beds", "capacity", "ambulances", "phone",
+                        "amenity", "wheelchair", "opening_hours", "emergency",
+                        "shelter_type", "social_facility:for",
+                    )
                     if k in tags
                 },
             }
@@ -265,6 +270,7 @@ def _build_plans(
         )
         allocations = [
             {
+                "facility_id": p.get("facility_id"),
                 "resource": p["name"],
                 "type": p["kind"],
                 "capacity": p["capacity"],
@@ -276,6 +282,9 @@ def _build_plans(
                 "lon": p.get("lon"),
                 "address": p.get("address"),
                 "label_source": p.get("label_source"),
+                # Preserve source tags so the application can derive only
+                # directly evidenced community-capability labels.
+                "tags": dict(p.get("tags") or {}),
             }
             for p in picks
         ]

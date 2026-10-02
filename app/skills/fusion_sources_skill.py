@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -81,6 +82,9 @@ class FusionSourcesSkill:
             "latitude": location.latitude,
             "longitude": location.longitude,
             "flood_analysis_radius_km": self.flood_analysis_radius_km,
+            "warning_radius_km": float(
+                os.getenv("NWS_WARNING_RADIUS_KM", "25")
+            ),
             # event_date may be injected by the caller (historical replay); defaults to today UTC.
             "event_date": event_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "event_start": event_start,

@@ -458,11 +458,11 @@ async def test_nwps_gauge_missing_degrades_gracefully(tmp_path, monkeypatch):
 
 # ----------------------------------------------------------------------
 # Degradation scenario 4: station distance exceeded (disambiguation
-# residue / multi-station network) -- warn, and the gate refuses
-# optimization
+# residue / multi-station network) -- block before cross-city fusion
+# and risk computation
 # ----------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_far_station_warns_but_completes(tmp_path, monkeypatch):
+async def test_far_station_blocks_before_risk_computation(tmp_path, monkeypatch):
     monkeypatch.setenv("HITL_ENABLED", "false")
     monkeypatch.setenv("FLOOD_STATION_MAX_DISTANCE_KM", "50")
     monkeypatch.setenv("NWS_WARNING_RADIUS_KM", "25")
@@ -494,18 +494,21 @@ async def test_far_station_warns_but_completes(tmp_path, monkeypatch):
         raw_task="assess flooding near Manhattan using USGS 06879650",
     )
 
-    # The assessment completes with a warning; resource optimization
-    # is refused by the evidence gate
-    assert result.status == "completed", result.summary
+    # Invalid target/station pairing is a hard stop. No station evidence,
+    # fusion, decision indices, or allocation may be created from mixed
+    # cities.
+    assert result.status == "error", result.summary
     codes = {i.code for i in result.validation_issues}
     assert "STATION_TARGET_DISTANCE_EXCEEDED" in codes
-    opt_attrs = {}
-    for ev in result.evidence:
-        if (ev.attributes or {}).get("optimization_status"):
-            opt_attrs = ev.attributes
-    assert opt_attrs.get("optimization_status") in (
-        None, "blocked_by_evidence_gate",
-    ) or opt_attrs.get("optimization_status") != "optimized"
+    assert result.evidence == []
+    called_tools = {tool for tool, _args in mcp.calls}
+    assert "get_flood_extent" not in called_tools
+    assert "get_available_resources" not in called_tools
+    assert any(
+        event.get("event")
+        == "assessment_blocked_invalid_station_pairing"
+        for event in state.events
+    )
 
 
 # ----------------------------------------------------------------------
@@ -941,6 +944,10 @@ async def test_historical_replay_time_alignment(tmp_path, monkeypatch):
     assert any(
         "Historical replay" in a for a in result.next_actions
     )
+    assert not any(
+        "freshness" in action.lower()
+        for action in result.next_actions
+    )
 
 
 @pytest.mark.asyncio
@@ -1272,3 +1279,28 @@ async def test_demo_mode_guarantees_slider_data(tmp_path, monkeypatch):
         ctx = ledger.get("sensitivity_context") or {}
         assert ctx.get("frontier_plan_impacts") and ctx.get("frontier_plans")
         assert ctx.get("optimization_objectives") and ctx.get("weights_used")
+
+
+@pytest.mark.asyncio
+async def test_offline_conflict_preset_is_visible_and_safe(monkeypatch):
+    """The dashboard preset must actually inject conflicting gauge
+    evidence, disclose it, and take the unattended no-dispatch path."""
+    _env_defaults(monkeypatch)
+
+    from app.demo_fixtures import run_demo_assessment
+
+    result, state = await run_demo_assessment(
+        demo_scenario="fusion_conflict"
+    )
+    assert result.status == "completed", result.summary
+    assert "MULTI_SOURCE_CONFLICT" in {
+        issue.code for issue in result.validation_issues
+    }
+    assert any(
+        event.get("event") == "fusion_conflict_flagged"
+        for event in state.events
+    )
+    assert not any(
+        (e.attributes or {}).get("optimization_status") == "optimized"
+        for e in result.evidence
+    )

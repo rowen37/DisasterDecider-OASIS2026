@@ -10,9 +10,10 @@ import time
 import uuid
 import warnings
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic_settings.exceptions import IncompleteFieldDefinitionWarning
 
 # Project-internal imports
@@ -53,6 +54,17 @@ def validate_hazard_type(value: str) -> HazardType:
 # ---------------------------------------------------------------------
 # Request models (module-level so FastAPI can resolve them)
 # ---------------------------------------------------------------------
+DemoScenario = Literal[
+    "nominal",
+    "metadata_503",
+    "no_sar",
+    "stale_sar",
+    "no_nwps",
+    "far_station",
+    "fusion_conflict",
+]
+
+
 class AssessRequest(BaseModel):
     query: str
     station_id: str | None = None
@@ -60,9 +72,15 @@ class AssessRequest(BaseModel):
     event_date: str | None = None          # YYYY-MM-DD
     vulnerability_weight: float | None = None
     equity_threshold: float | None = None
+    # Optional operator/field-report requirements for this event. These
+    # are not inferred from SVI and no live community feed is implied.
+    community_requirements: list[str] = Field(default_factory=list)
+    community_source: str | None = None
+    community_note: str | None = None
     # Demo mode: FakeMCP offline pipeline (zero network dependency);
     # yields full indices + equity ledger for any date.
     demo: bool = False
+    demo_scenario: DemoScenario = "nominal"
 
 
 class PlanSelectionRequest(BaseModel):
@@ -364,7 +382,9 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
             structured["rejected_sources"] = [
                 {
                     "source": r.get("source"),
-                    "reason": str(r.get("reason", ""))[:120],
+                    "reason": str(
+                        r.get("reason") or r.get("error") or ""
+                    )[:120],
                 }
                 for r in fusion.get("rejected_sources", [])
                 if isinstance(r, dict)
@@ -430,6 +450,10 @@ def _extract_structured_data(result: SkillResult, state: RunState) -> dict:
                 ),
                 "equity_ledger": attrs.get("equity_ledger"),
                 "plan_scenarios": attrs.get("plan_scenarios", []),
+                "community_input": attrs.get("community_input"),
+                "recommended_community_summary": rec.get(
+                    "community_summary"
+                ),
             }
 
         if isinstance(attrs.get("decision_indices"), dict):
@@ -760,6 +784,14 @@ def start_web_server():
 
     @app.post("/api/assess")
     async def assess(req: AssessRequest):
+        if not req.query.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "The query is empty. Enter a flood request with an "
+                    "explicit place and USGS station ID."
+                ),
+            )
         if mcp_manager is None and not req.demo:
             raise HTTPException(status_code=503, detail="MCP Manager not ready")
 
@@ -771,18 +803,28 @@ def start_web_server():
             overrides['vulnerability_weight'] = req.vulnerability_weight
         if req.equity_threshold is not None:
             overrides['equity_threshold'] = req.equity_threshold
+        if req.community_requirements:
+            overrides['community_requirements'] = req.community_requirements
+        if req.community_source:
+            overrides['community_source'] = req.community_source[:120]
+        if req.community_note:
+            overrides['community_note'] = req.community_note[:500]
 
         if req.demo:
             # Demo mode: FakeMCP offline pipeline, zero network
-            # dependency; always produces full decision indices plus an
-            # equity ledger. No HITL instance is registered (the
-            # FakeMCP pipeline is self-contained).
+            # dependency. Nominal and recoverable-fault presets produce
+            # full indices; safety presets may intentionally block risk
+            # or allocation. No external HITL instance is registered.
             from .demo_fixtures import run_demo_assessment
 
             result, state = await run_demo_assessment(
                 event_date=req.event_date,
                 vulnerability_weight=req.vulnerability_weight,
                 equity_threshold=req.equity_threshold,
+                community_requirements=req.community_requirements,
+                community_source=req.community_source,
+                community_note=req.community_note,
+                demo_scenario=req.demo_scenario,
             )
             hazard = "flood"
             run_id = state.run_id
@@ -973,6 +1015,13 @@ def start_web_server():
                 (result.summary or "")[:500]
                 if result.status == "error"
                 else None
+            ),
+            "validation_issues": [
+                issue.model_dump(mode="json")
+                for issue in result.validation_issues
+            ],
+            "demo_scenario": (
+                req.demo_scenario if req.demo else None
             ),
             "structured": structured,
             "gis_map_url": gis_map_url,

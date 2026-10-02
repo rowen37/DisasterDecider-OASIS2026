@@ -13,6 +13,7 @@ geometry to provide meter-based calculations with better local accuracy.
 
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -25,7 +26,11 @@ from pyproj import CRS, Geod
 from shapely.geometry import LineString, Point
 from mcp.server.fastmcp import FastMCP
 
-from overpass_client import OverpassError, post_overpass_sync
+from overpass_client import (
+    OverpassError,
+    configured_endpoints,
+    post_overpass_sync,
+)
 from osm_labels import load_label_overrides, osm_display_label
 
 
@@ -35,7 +40,7 @@ log = logging.getLogger("gis-vector")
 mcp = FastMCP("gis-vector-tools")
 
 WGS84 = "EPSG:4326"
-MAX_ROUTE_RADIUS_KM = 20.0
+MAX_ROUTE_CORRIDOR_KM = 8.0
 GEOD = Geod(ellps="WGS84")
 SUPPORTED_TRAVEL_MODES = {"drive", "walk", "bike"}
 # Conservative disaster-condition speeds. These are explicitly reported
@@ -45,6 +50,14 @@ TRAVEL_SPEED_MPS = {
     "walk": 4.0 / 3.6,
     "bike": 12.0 / 3.6,
 }
+
+
+def _osmnx_overpass_base(endpoint: str) -> str:
+    """Convert the shared client's interpreter URL to OSMnx's base URL."""
+
+    value = endpoint.rstrip("/")
+    suffix = "/interpreter"
+    return value[:-len(suffix)] if value.endswith(suffix) else value
 
 def _json(payload: dict[str, Any]) -> str:
     """Serialize tool output consistently."""
@@ -320,7 +333,8 @@ def vec_shortest_path(
     dest_lon: float,
     avoid_polygon_path: str = "",
     travel_mode: str = "drive",
-    search_radius_km: float = 8.0,
+    search_radius_km: float = 2.0,
+    expanded_search_radius_km: float = 4.0,
     output_path: str = "",
 ) -> str:
     """
@@ -331,7 +345,10 @@ def vec_shortest_path(
         dest_lat/lon: Destination in WGS84.
         avoid_polygon_path: Optional flood polygon GeoJSON.
         travel_mode: drive, walk, or bike.
-        search_radius_km: Requested OSM download radius, capped at 20 km.
+        search_radius_km: Initial half-width of the origin-to-destination
+            road-download corridor, in km.
+        expanded_search_radius_km: One wider corridor used only when the
+            initial downloaded graph has no connected base route.
         output_path: Output GeoJSON; auto-generated if empty.
 
     Notes:
@@ -355,9 +372,17 @@ def vec_shortest_path(
                 "tool": "vec_shortest_path",
             })
 
-        if search_radius_km <= 0:
+        if search_radius_km <= 0 or expanded_search_radius_km <= 0:
             return _json({
-                "error": "search_radius_km must be greater than 0",
+                "error": "route corridor widths must be greater than 0",
+                "tool": "vec_shortest_path",
+            })
+        if expanded_search_radius_km < search_radius_km:
+            return _json({
+                "error": (
+                    "expanded_search_radius_km must be greater than or "
+                    "equal to search_radius_km"
+                ),
                 "tool": "vec_shortest_path",
             })
 
@@ -379,9 +404,6 @@ def vec_shortest_path(
 
         output_path = _out(output_path, ".geojson")
 
-        mid_lat = (origin_lat + dest_lat) / 2.0
-        mid_lon = (origin_lon + dest_lon) / 2.0
-
         # Geodesic distance in meters (not a degree-based approximation).
         _, _, straight_m = GEOD.inv(
             origin_lon,
@@ -389,23 +411,208 @@ def vec_shortest_path(
             dest_lon,
             dest_lat,
         )
-        radius_m = min(
-            max(search_radius_km * 1_000.0, straight_m * 1.5),
-            MAX_ROUTE_RADIUS_KM * 1_000.0,
+        # OSMnx otherwise waits up to 180 seconds inside its synchronous
+        # Overpass request and defaults to one fixed host. Keep each attempt
+        # bounded and rotate across the same configured mirrors used by the
+        # project's other OSM tools.
+        route_request_timeout = max(
+            1.0,
+            float(os.getenv("OSM_ROUTE_REQUEST_TIMEOUT_SECONDS", "20")),
         )
+        # OSMnx embeds requests_timeout in Overpass QL as [timeout:N].
+        # Overpass accepts an integer there, not a decimal such as 20.0.
+        route_query_timeout = max(1, math.ceil(route_request_timeout))
+        route_max_downloads = max(
+            1,
+            min(2, int(os.getenv("OSM_ROUTE_MAX_DOWNLOAD_ATTEMPTS", "2"))),
+        )
+        route_endpoints = configured_endpoints()[:route_max_downloads]
 
-        log.info(
-            "Downloading OSM network center=(%.4f,%.4f) r=%.0fm",
-            mid_lat,
-            mid_lon,
-            radius_m,
+        route_line = gpd.GeoDataFrame(
+            geometry=[LineString([
+                (origin_lon, origin_lat),
+                (dest_lon, dest_lat),
+            ])],
+            crs=WGS84,
         )
-        G = ox.graph_from_point(
-            (mid_lat, mid_lon),
-            dist=radius_m,
-            network_type=travel_mode,
-            simplify=True,
-        )
+        route_crs = route_line.estimate_utm_crs()
+        if route_crs is None:
+            return _json({
+                "error": "Unable to determine a projected CRS for route corridor",
+                "tool": "vec_shortest_path",
+            })
+
+        corridor_widths = []
+        for value in (search_radius_km, expanded_search_radius_km):
+            width = min(float(value), MAX_ROUTE_CORRIDOR_KM)
+            if width not in corridor_widths:
+                corridor_widths.append(width)
+
+        G = None
+        orig_node = None
+        dest_node = None
+        used_corridor_km = None
+        route_overpass_attempts: list[dict[str, Any]] = []
+        download_count = 0
+        successful_endpoint: str | None = None
+        downloaded_graph = False
+        # OSMnx's private requester sleeps 55 seconds and recursively retries
+        # the same host on every 429/504. Replace only that request function
+        # for this bounded route call with the project's shared client. OSMnx
+        # still builds/simplifies the graph; HTTP now obeys our per-attempt
+        # budget and selected mirror.
+        from osmnx import _overpass as ox_overpass
+
+        active_route_endpoint: dict[str, str | None] = {"value": None}
+
+        def _bounded_route_overpass(data: Any) -> dict[str, Any]:
+            endpoint = active_route_endpoint["value"]
+            if not endpoint:
+                raise OverpassError("No active route Overpass endpoint")
+            query = str(data.get("data") or "")
+            payload, _diag = post_overpass_sync(
+                query,
+                server_timeout_s=route_request_timeout,
+                total_budget_s=route_request_timeout,
+                endpoints=[endpoint],
+            )
+            return payload
+
+        previous_overpass_url = ox.settings.overpass_url
+        previous_request_timeout = ox.settings.requests_timeout
+        previous_rate_limit = ox.settings.overpass_rate_limit
+        previous_overpass_request = ox_overpass._overpass_request
+        try:
+            ox.settings.requests_timeout = route_query_timeout
+            # Avoid a separate /status wait per mirror. The route layer has a
+            # strict two-download budget instead of waiting for public slots.
+            ox.settings.overpass_rate_limit = False
+            ox_overpass._overpass_request = _bounded_route_overpass
+
+            for width_km in corridor_widths:
+                if download_count >= route_max_downloads:
+                    break
+                corridor = (
+                    route_line.to_crs(route_crs)
+                    .geometry.buffer(width_km * 1_000.0)
+                    .to_crs(WGS84)
+                    .iloc[0]
+                )
+
+                # A transport/server failure rotates to the next mirror at
+                # the same width. A successfully downloaded but disconnected
+                # graph spends the one remaining attempt widening the same
+                # corridor, because changing mirrors cannot change topology.
+                if successful_endpoint:
+                    endpoints_for_width = [successful_endpoint]
+                else:
+                    endpoints_for_width = route_endpoints[download_count:]
+
+                candidate = None
+                candidate_endpoint = None
+                for endpoint in endpoints_for_width:
+                    if download_count >= route_max_downloads:
+                        break
+                    download_count += 1
+                    active_route_endpoint["value"] = endpoint
+                    ox.settings.overpass_url = _osmnx_overpass_base(endpoint)
+                    log.info(
+                        "Downloading OSM route corridor length=%.1fkm "
+                        "half_width=%.1fkm endpoint=%s attempt=%d/%d",
+                        straight_m / 1_000.0,
+                        width_km,
+                        endpoint,
+                        download_count,
+                        route_max_downloads,
+                    )
+                    try:
+                        candidate = ox.graph_from_polygon(
+                            corridor,
+                            network_type=travel_mode,
+                            simplify=True,
+                            retain_all=True,
+                            truncate_by_edge=True,
+                        )
+                    except Exception as endpoint_exc:
+                        route_overpass_attempts.append({
+                            "endpoint": endpoint,
+                            "corridor_half_width_km": width_km,
+                            "status": "failed",
+                            "error": str(endpoint_exc)[:240],
+                        })
+                        log.warning(
+                            "Route Overpass mirror failed (%s): %s",
+                            endpoint,
+                            endpoint_exc,
+                        )
+                        candidate = None
+                        # A 400 response means Overpass rejected the query
+                        # itself. Sending the same invalid query to another
+                        # mirror only adds delay and cannot recover it.
+                        if str(endpoint_exc).startswith(
+                            "Overpass rejected the query"
+                        ):
+                            break
+                        continue
+
+                    candidate_endpoint = endpoint
+                    successful_endpoint = endpoint
+                    downloaded_graph = True
+                    route_overpass_attempts.append({
+                        "endpoint": endpoint,
+                        "corridor_half_width_km": width_km,
+                        "status": "downloaded",
+                    })
+                    break
+
+                if candidate is None:
+                    break
+
+                candidate_orig = ox.distance.nearest_nodes(
+                    candidate, origin_lon, origin_lat
+                )
+                candidate_dest = ox.distance.nearest_nodes(
+                    candidate, dest_lon, dest_lat
+                )
+                if nx.has_path(candidate, candidate_orig, candidate_dest):
+                    G = candidate
+                    orig_node = candidate_orig
+                    dest_node = candidate_dest
+                    used_corridor_km = width_km
+                    successful_endpoint = candidate_endpoint
+                    break
+                log.warning(
+                    "No connected base route in %.1fkm corridor; expanding once",
+                    width_km,
+                )
+        finally:
+            ox.settings.overpass_url = previous_overpass_url
+            ox.settings.requests_timeout = previous_request_timeout
+            ox.settings.overpass_rate_limit = previous_rate_limit
+            ox_overpass._overpass_request = previous_overpass_request
+
+        if G is None or orig_node is None or dest_node is None:
+            if not downloaded_graph:
+                return _json({
+                    "error": "overpass_route_download_failed",
+                    "reason": "All bounded route-network mirror attempts failed",
+                    "overpass_attempts": route_overpass_attempts,
+                    "_meta": {"tool": "vec_shortest_path"},
+                })
+            return _json({
+                "error": "no_path_found",
+                "reason": "No connected base route in the configured corridors",
+                "corridor_widths_tried_km": corridor_widths,
+                "overpass_attempts": route_overpass_attempts,
+                "_meta": {"tool": "vec_shortest_path"},
+            })
+
+        # Preserve the downloaded base graph. Flood avoidance operates on a
+        # copy, so a disconnected avoiding route can fall back to the same
+        # graph without a second Overpass download.
+        base_graph = G
+        route_graph = G.copy() if avoid_polygon_path else G
+        route_avoids_flood = bool(avoid_polygon_path)
 
         flooded_removed = 0
 
@@ -424,45 +631,41 @@ def vec_shortest_path(
                 flood_union = flood_gdf.geometry.union_all()
                 to_remove: list[tuple[Any, Any, Any]] = []
 
-                for u, v, k, data in G.edges(keys=True, data=True):
+                for u, v, k, data in route_graph.edges(keys=True, data=True):
                     geom = data.get("geometry")
                     if geom is None:
                         geom = LineString([
-                            (G.nodes[u]["x"], G.nodes[u]["y"]),
-                            (G.nodes[v]["x"], G.nodes[v]["y"]),
+                            (route_graph.nodes[u]["x"], route_graph.nodes[u]["y"]),
+                            (route_graph.nodes[v]["x"], route_graph.nodes[v]["y"]),
                         ])
                     if geom.intersects(flood_union):
                         to_remove.append((u, v, k))
 
-                G.remove_edges_from(to_remove)
+                route_graph.remove_edges_from(to_remove)
                 flooded_removed = len(to_remove)
                 log.info("Removed %d flood-intersecting edges", flooded_removed)
 
-        orig_node = ox.distance.nearest_nodes(G, origin_lon, origin_lat)
-        dest_node = ox.distance.nearest_nodes(G, dest_lon, dest_lat)
-
-        if not nx.has_path(G, orig_node, dest_node):
-            return _json({
-                "error": "no_path_found",
-                "reason": "No connected route remains after flood-edge removal",
-                "flooded_edges_removed": flooded_removed,
-                "_meta": {"tool": "vec_shortest_path"},
-            })
+        if not nx.has_path(route_graph, orig_node, dest_node):
+            route_graph = base_graph
+            route_avoids_flood = False
 
         path_nodes = nx.shortest_path(
-            G,
+            route_graph,
             orig_node,
             dest_node,
             weight="length",
         )
         path_length = float(nx.shortest_path_length(
-            G,
+            route_graph,
             orig_node,
             dest_node,
             weight="length",
         ))
 
-        coords = [(G.nodes[n]["x"], G.nodes[n]["y"]) for n in path_nodes]
+        coords = [
+            (route_graph.nodes[n]["x"], route_graph.nodes[n]["y"])
+            for n in path_nodes
+        ]
         route_gdf = gpd.GeoDataFrame(
             [{
                 "path_length_m": round(path_length, 1),
@@ -488,6 +691,15 @@ def vec_shortest_path(
             },
             "node_count": len(path_nodes),
             "flooded_edges_removed": flooded_removed,
+            "route_avoids_flood": route_avoids_flood,
+            "download_geometry": "origin_destination_corridor",
+            "corridor_half_width_km": used_corridor_km,
+            "corridor_widths_tried_km": [
+                width for width in corridor_widths
+                if used_corridor_km is None or width <= used_corridor_km
+            ],
+            "overpass_endpoint": successful_endpoint,
+            "overpass_attempts": route_overpass_attempts,
             "origin": {"lat": origin_lat, "lon": origin_lon},
             "destination": {"lat": dest_lat, "lon": dest_lon},
             "_meta": {

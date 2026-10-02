@@ -187,6 +187,23 @@
         .lambda-box input[type=range] { width: 100%; }
         #report-text { white-space: pre-wrap; font-family: inherit; font-size: 12px; color: #233; line-height: 1.5; max-height: 240px; overflow-y: auto; }
         .uncertainty-box { padding: 6px 8px; background: #fff8e1; border-radius: 6px; margin: 6px 0; font-size: 12px; }
+        #warnings-panel {
+            display: none;
+            margin: 8px 0;
+            padding: 8px 10px;
+            border: 1px solid #f0c36d;
+            border-left: 4px solid #e09b24;
+            border-radius: 6px;
+            background: #fff8e1;
+            font-size: 11px;
+        }
+        #warnings-panel.has-error {
+            border-color: #e69a9a;
+            border-left-color: #c62828;
+            background: #fff1f1;
+        }
+        .warning-item { margin-top: 5px; line-height: 1.35; }
+        .warning-code { font-family: ui-monospace, monospace; font-weight: 700; }
 
         /* Error modal */
         #error-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:11000; justify-content:center; align-items:center; }
@@ -311,8 +328,8 @@
             display: flex;
             gap: 12px;
             align-items: center;
-            width: 60%;
-            max-width: 700px;
+            width: 80%;
+            max-width: 1050px;
             backdrop-filter: blur(4px);
         }
         #query-form input[type="text"] {
@@ -340,12 +357,51 @@
             background: #a0b8d0;
             cursor: not-allowed;
         }
+        #demo-scenario {
+            max-width: 190px;
+            padding: 8px 9px;
+            border: 1px solid #9fc4a2;
+            border-radius: 8px;
+            background: #f5fff5;
+            color: #214f25;
+            font-size: 12px;
+        }
+        #community-input-panel {
+            position: absolute;
+            bottom: 94px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            width: min(760px, 86%);
+            background: rgba(255,255,255,0.94);
+            border: 1px solid #d8e0e8;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.16);
+            padding: 7px 12px;
+            font-size: 12px;
+            backdrop-filter: blur(4px);
+        }
+        #community-input-panel summary { cursor: pointer; font-weight: 700; color: #24425f; }
+        .community-requirements { display: flex; flex-wrap: wrap; gap: 7px 14px; margin-top: 8px; }
+        .community-requirements label { display: flex; align-items: center; gap: 4px; }
+        .community-input-meta { display: flex; gap: 8px; margin-top: 8px; }
+        .community-input-meta select, .community-input-meta input {
+            border: 1px solid #c7d1dc; border-radius: 5px; padding: 5px; background: white;
+        }
+        .community-input-meta input { flex: 1; }
+        .community-labels { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+        .community-label { border-radius: 10px; padding: 2px 7px; font-size: 10px; }
+        .community-label.supported { background: #e3f3e7; color: #17632a; }
+        .community-label.unknown { background: #fff3cd; color: #725600; }
+        .community-label.unmet, .community-label.unsupported { background: #f8d7da; color: #842029; }
 
         /* Responsive */
         @media (max-width: 768px) {
             #info-panel { width: 280px; right: 10px; top: 10px; font-size: 13px; padding: 12px 14px; }
             #query-form { width: 92%; bottom: 12px; flex-wrap: wrap; justify-content: center; }
             #query-form input[type="text"] { width: 100%; }
+            #community-input-panel { width: 92%; bottom: 142px; }
+            .community-input-meta { flex-direction: column; }
             #site-title { font-size: 16px; padding: 2px 14px; top: 8px; }
         }
     </style>
@@ -543,6 +599,11 @@
                 <span class="stat-value" id="status-badge"><span class="badge badge-unknown">--</span></span>
             </div>
 
+            <div id="warnings-panel" role="status" aria-live="polite">
+                <strong>Warnings / Degraded reasons</strong>
+                <div id="warnings-list"></div>
+            </div>
+
             <div id="recommendation">
                 <strong>Next Action</strong>
                 <span id="next-action-text">Waiting for assessment...</span>
@@ -573,11 +634,42 @@
         </div>
     </div>
 
+    <!-- Optional event-level community requirements.  This is deliberately
+         operator-entered: the project does not claim a live community feed. -->
+    <details id="community-input-panel">
+        <summary>Community requirements (optional, no live feed)</summary>
+        <div class="community-requirements">
+            <label><input type="checkbox" name="community-requirement" value="emergency_rescue"> Emergency rescue / evacuation</label>
+            <label><input type="checkbox" name="community-requirement" value="safe_transport"> Safe pickup / transport</label>
+            <label><input type="checkbox" name="community-requirement" value="temporary_shelter"> Temporary shelter / safe stay</label>
+            <label><input type="checkbox" name="community-requirement" value="special_population_support"> Children / older adults / disability support</label>
+        </div>
+        <div class="community-input-meta">
+            <select id="community-source" title="Where these event requirements came from">
+                <option value="operator_observation">Operator observation</option>
+                <option value="field_report">Field report</option>
+                <option value="community_organization">Community organization</option>
+                <option value="311_or_211_summary">311 / 211 summary</option>
+                <option value="historical_replay">Historical replay evidence</option>
+            </select>
+            <input id="community-note" type="text" maxlength="500" placeholder="Optional source note; unchecked does not mean no need">
+        </div>
+    </details>
+
     <!-- Query Form -->
     <div id="query-form">
         <input type="text" id="query-input" placeholder="e.g., flood Manhattan Kansas 06887000 — or — assess flooding near Friendswood station 08077600" value="Assess flood around Friendswood station 08077600">
         <input type="text" id="event-date" placeholder="event date YYYY-MM-DD (optional)" title="Optional event date — empty = real-time assessment; a past date = historical replay with strict time alignment" style="width:170px;padding:8px;border-radius:6px;border:1px solid #cfd8e3;background:#fff;color:#1a2b3c;">
-        <button id="submit-demo" title="Fixed offline Friendswood flood fixture; it does not assess the place typed in the query box" style="background:#2e7d32;">Friendswood Demo</button>
+        <select id="demo-scenario" title="Choose a deterministic offline demo or fault-injection path">
+            <option value="nominal">Offline: nominal</option>
+            <option value="metadata_503">Fault: metadata 503</option>
+            <option value="no_sar">Fault: no SAR imagery</option>
+            <option value="stale_sar">Fault: stale SAR (2017 replay)</option>
+            <option value="no_nwps">Fault: no NWPS data</option>
+            <option value="far_station">Fault: far/wrong station</option>
+            <option value="fusion_conflict">Fault: source conflict</option>
+        </select>
+        <button id="submit-demo" title="Runs the selected deterministic offline fixture; the typed place is not sent to external services" style="background:#2e7d32;">Run Offline Demo</button>
         <button id="submit-query">Execute</button>
     </div>
 
@@ -1020,7 +1112,11 @@
 
         async function submitQuery(demo) {
             const query = queryInput.value.trim();
-            if (!query) return;
+            if (!query) {
+                showError('The query is empty. Enter a flood request with a place and USGS station ID.');
+                queryInput.focus();
+                return;
+            }
 
             // Optional event date: empty = real-time assessment; a past
             // date = historical replay (strict time alignment: gauge
@@ -1034,13 +1130,23 @@
                 showError('Event date must be in YYYY-MM-DD format (e.g., 2017-08-27), or left empty for real-time assessment.');
                 return;
             }
+            const communityRequirements = Array.from(
+                document.querySelectorAll('input[name="community-requirement"]:checked')
+            ).map(input => input.value);
+            const communitySource = communityRequirements.length
+                ? document.getElementById('community-source').value
+                : null;
+            const communityNote = document.getElementById('community-note').value.trim() || null;
+            const demoScenario = demo
+                ? document.getElementById('demo-scenario').value
+                : 'nominal';
 
             const activeButton = demo
                 ? document.getElementById('submit-demo')
                 : submitBtn;
             const originalButtonText = activeButton.textContent;
             activeButton.disabled = true;
-            activeButton.textContent = demo ? '⏳ Friendswood Demo...' : '⏳ Assessing...';
+            activeButton.textContent = demo ? '⏳ Running offline...' : '⏳ Assessing...';
             loadingOverlay.classList.add('active');
             document.getElementById('map').classList.add('loading');
 
@@ -1048,7 +1154,15 @@
                 const resp = await fetch('/api/assess', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query, event_date: eventDate, demo: !!demo })
+                    body: JSON.stringify({
+                        query,
+                        event_date: eventDate,
+                        demo: !!demo,
+                        demo_scenario: demoScenario,
+                        community_requirements: communityRequirements,
+                        community_source: communitySource,
+                        community_note: communityNote
+                    })
                 });
                 let data = null;
                 try { data = await resp.json(); } catch (_) {}
@@ -1216,6 +1330,50 @@
                 decHtml += '<div style="color:#a15c00;">⚠ Bridge exposure not calculated; it is not in the paper’s confidence formula.</div>';
             }
             $('decision-extras').innerHTML = decHtml;
+
+            // Consolidate backend validation issues and degraded-data
+            // reasons so failures are explicit rather than inferred from
+            // an empty metric or missing map layer.
+            const warningsPanel = $('warnings-panel');
+            const validationIssues = Array.isArray(data.validation_issues)
+                ? data.validation_issues : [];
+            const seenWarnings = new Set();
+            const warningRows = [];
+            validationIssues.forEach(issue => {
+                const code = issue.code || 'VALIDATION_ISSUE';
+                const key = `${code}|${issue.message || ''}`;
+                if (seenWarnings.has(key)) return;
+                seenWarnings.add(key);
+                warningRows.push({
+                    severity: issue.severity || 'warning',
+                    code,
+                    message: issue.message || 'No detail supplied.'
+                });
+            });
+            (di.data_gaps || []).forEach(gap => {
+                const key = `DATA_GAP|${gap}`;
+                if (seenWarnings.has(key)) return;
+                seenWarnings.add(key);
+                warningRows.push({
+                    severity: 'warning', code: 'DATA_GAP', message: String(gap)
+                });
+            });
+            (ropt.planning_gaps || []).forEach(gap => {
+                const key = `PLANNING_GAP|${gap}`;
+                if (seenWarnings.has(key)) return;
+                seenWarnings.add(key);
+                warningRows.push({
+                    severity: 'warning', code: 'PLANNING_GAP', message: String(gap)
+                });
+            });
+            warningsPanel.style.display = warningRows.length ? 'block' : 'none';
+            warningsPanel.classList.toggle(
+                'has-error',
+                warningRows.some(row => ['error', 'critical'].includes(row.severity))
+            );
+            $('warnings-list').innerHTML = warningRows.map(row =>
+                `<div class="warning-item"><span class="warning-code">${escapeHtml(row.code)}</span> — ${escapeHtml(row.message)}</div>`
+            ).join('');
             $('report-text').textContent = data.report || 'No report generated.';
         }
 
@@ -1274,6 +1432,25 @@
             });
         }
 
+        function communityLabelsHtml(summary) {
+            if (!summary || !Array.isArray(summary.labels) || !summary.labels.length) return '';
+            return `<div class="community-labels">${summary.labels.map(item => {
+                const marker = item.status === 'supported' ? '✓' : (item.status === 'unmet' ? '✕' : '?');
+                return `<span class="community-label ${escapeHtml(item.status)}">${marker} ${escapeHtml(item.label)}</span>`;
+            }).join('')}</div>`;
+        }
+
+        function communitySummaryHtml(summary) {
+            if (!summary || !summary.community_requirements_total) return '';
+            const total = summary.community_requirements_total;
+            return `<div class="plan-subsection">
+                <div class="plan-subsection-title">Community requirement fit</div>
+                <div class="plan-subsection-value">${summary.community_requirements_met}/${total} confirmed · ${summary.community_unknown_count} unknown · ${summary.community_unmet_count} unmet</div>
+                ${communityLabelsHtml(summary)}
+                <div style="font-size:10px;color:#777;margin-top:4px;">Static facility evidence + event input; no live community feed.</div>
+            </div>`;
+        }
+
         function renderPlanDetail(p) {
             const box = $('plan-detail');
             box.style.display = 'block';
@@ -1304,6 +1481,7 @@
                     <div class="plan-subsection-value tract-list">${covered.length ? covered.join(', ') : 'None'}</div>
                 </div>
                 ${highSvi.length ? `<div class="plan-subsection"><div class="plan-subsection-title">High-SVI tracts prioritized</div><div class="plan-subsection-value tract-list">${highSvi.join(', ')}</div></div>` : ''}
+                ${communitySummaryHtml(p.community_summary)}
             `;
         }
 
@@ -1314,13 +1492,17 @@
                 return;
             }
             box.style.display = 'block';
-            box.innerHTML = '<strong>Choose a planning priority</strong>' + scenarios.map(s => `
+            box.innerHTML = '<strong>Choose a planning priority</strong>' + scenarios.map(s => {
+                const summary = (s.metrics || {}).community_summary;
+                return `
                 <div style="border-top:1px solid #ddd;margin-top:7px;padding-top:7px;">
-                    <div><strong>${s.label}</strong> → ${s.plan_id}</div>
-                    <div style="font-size:11px;color:#666;">${s.description || ''}</div>
-                    <button class="select-plan-btn" data-scenario="${s.scenario_id}" data-plan="${s.plan_id}"
+                    <div><strong>${escapeHtml(s.label)}</strong> → ${escapeHtml(s.plan_id)}</div>
+                    <div style="font-size:11px;color:#666;">${escapeHtml(s.description || '')}</div>
+                    ${communitySummaryHtml(summary)}
+                    <button class="select-plan-btn" data-scenario="${escapeHtml(s.scenario_id)}" data-plan="${escapeHtml(s.plan_id)}"
                         style="margin-top:5px;padding:4px 8px;cursor:pointer;">Select this plan</button>
-                </div>`).join('') + '<div id="plan-selection-result" style="margin-top:6px;font-size:11px;"></div>';
+                </div>`;
+            }).join('') + '<div id="plan-selection-result" style="margin-top:6px;font-size:11px;"></div>';
             box.querySelectorAll('.select-plan-btn').forEach(button => {
                 button.addEventListener('click', async () => {
                     const result = $('plan-selection-result');

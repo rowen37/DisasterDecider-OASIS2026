@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..community import enrich_resource_plans
 from ..models import Location
 from .fusion import _render_template
 
@@ -144,4 +145,7 @@ class ResourceSkill:
                 "Resource discovery MCP must return a 'resources' list."
             )
 
-        return resources
+        # Community capabilities are sourced static attributes. Missing
+        # attributes remain unknown; this layer never invents a service from
+        # the absence of data or from a community demographic proxy.
+        return enrich_resource_plans(resources)

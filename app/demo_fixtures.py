@@ -29,6 +29,16 @@ from .utils import geodesic_km
 NOW = datetime.now(timezone.utc).isoformat()
 TOMORROW = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
 
+DEMO_SCENARIOS = {
+    "nominal",
+    "metadata_503",
+    "no_sar",
+    "stale_sar",
+    "no_nwps",
+    "far_station",
+    "fusion_conflict",
+}
+
 
 def _ring(lon, lat, d=0.02):
     return [[lon - d, lat - d], [lon + d, lat - d],
@@ -85,14 +95,9 @@ the GIS visualization product in demo mode.</p>
 
 # ── Shortest path on a road network (demo rescue route) ──────────
 # Prefers the real OSM road cache (built by scripts/build_demo_road_cache.py
-# with osmnx: directed drive network with street polylines): endpoints
-# snap to the nearest nodes, flooded edges are removed via shapely
-# intersection tests, Dijkstra finds the shortest path by edge length —
-# same semantics as gis_vector_server.vec_shortest_path. A disconnected
-# graph returns no_path_found (the caller retries without flood
-# avoidance); travel time uses conservative speeds (drive 30 km/h).
-# Falls back to a deterministic synthetic grid network when the cache
-# is missing, so the demo always runs.
+# with osmnx): endpoints snap to the nearest nodes, flooded edges are removed,
+# and Dijkstra follows the cached directed street graph. A deterministic
+# synthetic grid remains the offline fallback when the cache is unavailable.
 _TRAVEL_SPEED_MPS = {
     "drive": 30.0 / 3.6,
     "walk": 4.0 / 3.6,
@@ -106,7 +111,6 @@ _DEMO_ROAD_CACHE_PATH = os.path.join(
 _demo_road_cache = None
 _demo_road_cache_loaded = False
 
-
 def _demo_jitter(i: int, j: int, scale: float) -> float:
     """Deterministic node jitter (integer-hash modulo): street-like placement, reproducible."""
     h = ((i + 8) * 73856093) ^ ((j + 16) * 19349663)
@@ -114,7 +118,7 @@ def _demo_jitter(i: int, j: int, scale: float) -> float:
 
 
 def _demo_street_grid(origin, dest, dlat=0.006, dlon=0.008):
-    """Fallback network: synthetic grid nodes covering the origin-dest bounding box (padded by 2 cells)."""
+    """Deterministic grid covering the origin/destination corridor."""
     lat0 = min(origin[0], dest[0]) - 2 * dlat
     lon0 = min(origin[1], dest[1]) - 2 * dlon
     ni = int(math.ceil((max(origin[0], dest[0]) + 2 * dlat - lat0) / dlat)) + 1
@@ -130,31 +134,28 @@ def _demo_street_grid(origin, dest, dlat=0.006, dlon=0.008):
 
 
 def _load_demo_road_cache():
-    """Load the real OSM road cache; return None if missing or corrupt
-    (caller falls back to the synthetic grid).
+    """Load the generated OSM street cache or return ``None``."""
 
-    Returns (nodes, adj): nodes = {id: (lat, lon)}; adj =
-    {u: [(v, length_m, geom)]} where geom is the street polyline of a
-    simplified OSM edge ([[lon, lat], ...], oriented u -> v) or None
-    (straight edge). Directed: one-way semantics match the real tool.
-    """
     global _demo_road_cache, _demo_road_cache_loaded
     if _demo_road_cache_loaded:
         return _demo_road_cache
     _demo_road_cache_loaded = True
     try:
-        with open(_DEMO_ROAD_CACHE_PATH, encoding="utf-8") as fh:
-            payload = json.load(fh)
-        nodes = {k: (float(v[0]), float(v[1])) for k, v in payload["nodes"].items()}
-        adj: dict = {}
-        # Edges are written as [u, v, length_m, coords, attrs] by the
-        # current cache builder; older caches lack the attrs element.
-        # Both layouts are accepted so a rebuilt cache keeps working.
+        with open(_DEMO_ROAD_CACHE_PATH, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        nodes = {
+            str(node_id): (float(value[0]), float(value[1]))
+            for node_id, value in payload["nodes"].items()
+        }
+        adjacency = {}
         for edge in payload["edges"]:
-            u, v, length_m = str(edge[0]), str(edge[1]), float(edge[2])
-            geom = edge[3] if len(edge) >= 4 else None
-            adj.setdefault(u, []).append((v, length_m, geom))
-        _demo_road_cache = (nodes, adj)
+            source, destination = str(edge[0]), str(edge[1])
+            length_m = float(edge[2])
+            geometry = edge[3] if len(edge) >= 4 else None
+            adjacency.setdefault(source, []).append(
+                (destination, length_m, geometry)
+            )
+        _demo_road_cache = (nodes, adjacency)
     except (OSError, ValueError, KeyError, TypeError):
         _demo_road_cache = None
     return _demo_road_cache
@@ -256,7 +257,13 @@ def _demo_dijkstra(adj, source, goal):
 class FakeMCP:
     """In-memory MCP stand-in that returns offline fixtures by tool name."""
 
-    def __init__(self):
+    def __init__(self, scenario: str = "nominal"):
+        if scenario not in DEMO_SCENARIOS:
+            raise ValueError(
+                f"Unknown demo scenario {scenario!r}; expected one of: "
+                + ", ".join(sorted(DEMO_SCENARIOS))
+            )
+        self.scenario = scenario
         self.calls: list[tuple[str, dict]] = []
 
     async def call(self, tool_name: str, arguments: dict, **_policy) -> str:
@@ -280,6 +287,11 @@ class FakeMCP:
 
     # -- Geocoding -----------------------------------------------------
     def _fx_geocode_location(self, args):
+        if self.scenario == "far_station":
+            return (
+                f"{args['place_name']} 的坐标: 纬度 47.6062, "
+                "经度 -122.3321"
+            )
         return (
             f"{args['place_name']} 的坐标: 纬度 29.5294, 经度 -95.2010"
         )
@@ -295,6 +307,11 @@ class FakeMCP:
 
     # -- USGS / NWPS chain ---------------------------------------------
     def _fx_get_station_metadata(self, args):
+        if self.scenario == "metadata_503":
+            return {
+                "status": "error",
+                "error": "HTTP 503 Service Unavailable (offline fault demo)",
+            }
         return {
             "status": "ok",
             "metadata": {
@@ -338,6 +355,10 @@ class FakeMCP:
                 }
             except ValueError:
                 pass
+        water_level = 20.0 if args.get("demo_conflict") else 8.0
+        if window_summary is not None and args.get("demo_conflict"):
+            window_summary = dict(window_summary)
+            window_summary["peak_stage_ft"] = water_level
         return {
             "status": "ok",
             "query_window": (
@@ -347,7 +368,7 @@ class FakeMCP:
             ),
             "observation": {
                 "station_id": "08077600",
-                "water_level": 8.0,
+                "water_level": water_level,
                 "unit": "ft",
                 "observation_time": obs_time,
                 "observation_semantics": semantics,
@@ -401,6 +422,11 @@ class FakeMCP:
         }
 
     def _fx_get_nwps_gauge(self, args):
+        if self.scenario == "no_nwps":
+            return {
+                "status": "error",
+                "error": "NWPS could not find a matching gauge (offline fault demo)",
+            }
         return {
             "status": "ok",
             "gauge": {
@@ -507,6 +533,13 @@ class FakeMCP:
         # acquisition on that date + 1 day (historical replay stays
         # time-aligned); default/today uses 12 hours ago so the
         # real-time gate [-30, +1] always passes.
+        if self.scenario == "no_sar":
+            return {
+                "status": "error",
+                "error_code": "NO_OBSERVATION_IMAGERY",
+                "error": "No Sentinel-1 SAR scenes in the event window (offline fault demo)",
+            }
+
         requested = args.get("observation_date")
         try:
             _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -523,6 +556,11 @@ class FakeMCP:
             _acq = (
                 datetime.now(timezone.utc) - timedelta(hours=12)
             ).isoformat()
+        if self.scenario == "stale_sar":
+            # The scenario forces a historical event date in
+            # run_demo_assessment; today's acquisition must therefore
+            # fail the event-window freshness gate.
+            _acq = datetime.now(timezone.utc).isoformat()
         return {
             "status": "ok",
             "source": "Google Earth Engine / Sentinel-1 SAR",
@@ -623,7 +661,7 @@ class FakeMCP:
     # (VWUN = Σ P_exposed·(1−C)·(1+λ·SVI); P_exposed already includes
     # flooded-fraction weighting — see social_good.py.)
     def _fx_get_available_resources(self, args):
-        return {
+        payload = {
             "status": "ok",
             "resources": [
                 {
@@ -724,6 +762,42 @@ class FakeMCP:
                 },
             ],
         }
+        # Sourced fixture capabilities make the offline demo exercise the
+        # community-matching path without pretending these are live facts.
+        fixture_capabilities = {
+            "F1": {
+                "emergency_rescue": True,
+                "high_water_rescue": True,
+                "pickup_service": True,
+            },
+            "S1": {
+                "temporary_shelter": True,
+                "overnight_shelter": True,
+                "family_support": True,
+                "wheelchair_accessible": True,
+            },
+            "H1": {
+                "medical_support": True,
+                "wheelchair_accessible": True,
+                "accessible_transport": True,
+            },
+            "H2": {
+                "medical_support": True,
+                "wheelchair_accessible": True,
+            },
+        }
+        for plan in payload["resources"]:
+            for allocation in plan.get("allocations", []):
+                resource = allocation.get("resource")
+                allocation["facility_id"] = f"demo:{resource}"
+                allocation["community_capabilities"] = dict(
+                    fixture_capabilities.get(resource, {})
+                )
+                allocation["community_capability_evidence"] = [{
+                    "source": "Friendswood offline demo fixture",
+                    "verification_status": "synthetic_demo",
+                }]
+        return payload
 
     # -- GIS vector tools -----------------------------------------------
     def _fx_poi_search_osm(self, args):
@@ -825,15 +899,12 @@ class FakeMCP:
         }
 
     def _fx_vec_shortest_path(self, args):
-        # Computed over the real OSM road network (synthetic grid
-        # fallback when the cache is missing): snap origin/destination
-        # → optionally remove flooded edges via the flood polygon →
-        # Dijkstra → street-polyline GeoJSON with consistent
-        # length/travel time. The hospital sits inside the demo flood
-        # polygon, so flood-avoiding requests always yield
-        # no_path_found; the pipeline then retries without flood
-        # avoidance per the real contract and discloses
-        # route_avoids_flood.
+        # Computed over the cached OSM street graph (deterministic grid only
+        # when the cache is missing): snap endpoints → optionally remove
+        # flooded edges → Dijkstra → polyline GeoJSON.
+        # The hospital sits inside the demo flood polygon, so an
+        # unreachable flood-avoiding route falls back to the same base
+        # graph and discloses route_avoids_flood=False.
         origin = (float(args["origin_lat"]), float(args["origin_lon"]))
         dest = (float(args["dest_lat"]), float(args["dest_lon"]))
         travel_mode = str(args.get("travel_mode", "drive") or "drive")
@@ -845,76 +916,76 @@ class FakeMCP:
             str(args.get("avoid_polygon_path", "") or "")
         )
 
-        cache = _load_demo_road_cache()
-        if cache is not None:
-            nodes, adj_full = cache
+        road_cache = _load_demo_road_cache()
+        using_osm_cache = road_cache is not None
+        if using_osm_cache:
+            nodes, base_adjacency = road_cache
+        else:
+            nodes = _demo_street_grid(origin, dest)
+            base_adjacency = None
 
-            def snap(p):
-                return min(
-                    nodes,
-                    key=lambda n: geodesic_km(
-                        p[0], p[1], nodes[n][0], nodes[n][1]
-                    ),
-                )
+        def snap(p):
+            return min(
+                nodes,
+                key=lambda n: geodesic_km(
+                    p[0], p[1], nodes[n][0], nodes[n][1]
+                ),
+            )
 
-            src, goal = snap(origin), snap(dest)
-            adj = {}
-            removed = 0
-            for u, outs in adj_full.items():
-                for v, w, geom in outs:
-                    coords = geom or [
-                        [nodes[u][1], nodes[u][0]],
-                        [nodes[v][1], nodes[v][0]],
+        src, goal = snap(origin), snap(dest)
+        adj = {}
+        removed = 0
+        if using_osm_cache:
+            for node, outgoing in base_adjacency.items():
+                for neighbor, weight, geometry in outgoing:
+                    coordinates = geometry or [
+                        [nodes[node][1], nodes[node][0]],
+                        [nodes[neighbor][1], nodes[neighbor][0]],
                     ]
-                    if blocked is not None and blocked(coords):
+                    if blocked is not None and blocked(coordinates):
                         removed += 1
                         continue
-                    adj.setdefault(u, []).append((v, w, geom))
+                    adj.setdefault(node, []).append(
+                        (neighbor, weight, geometry)
+                    )
         else:
-            # Fallback: deterministic synthetic grid network (demo runs
-            # even without the real cache)
-            nodes = _demo_street_grid(origin, dest)
-
-            def snap(p):
-                return min(
-                    nodes,
-                    key=lambda n: geodesic_km(
-                        p[0], p[1], nodes[n][0], nodes[n][1]
-                    ),
-                )
-
-            src, goal = snap(origin), snap(dest)
-            adj = {}
-            removed = 0
             for node in nodes:
                 i, j = node
-                for nb in ((i + 1, j), (i, j + 1)):
-                    if nb not in nodes:
+                for neighbor in ((i + 1, j), (i, j + 1)):
+                    if neighbor not in nodes:
                         continue
-                    w = geodesic_km(
+                    weight = geodesic_km(
                         nodes[node][0], nodes[node][1],
-                        nodes[nb][0], nodes[nb][1],
+                        nodes[neighbor][0], nodes[neighbor][1],
                     ) * 1000.0
-                    coords = [
+                    coordinates = [
                         [nodes[node][1], nodes[node][0]],
-                        [nodes[nb][1], nodes[nb][0]],
+                        [nodes[neighbor][1], nodes[neighbor][0]],
                     ]
-                    if blocked is not None and blocked(coords):
+                    if blocked is not None and blocked(coordinates):
                         removed += 1
                         continue
-                    adj.setdefault(node, []).append((nb, w, coords))
+                    adj.setdefault(node, []).append(
+                        (neighbor, weight, coordinates)
+                    )
+                    adj.setdefault(neighbor, []).append(
+                        (node, weight, list(reversed(coordinates)))
+                    )
 
         result = _demo_dijkstra(adj, src, goal)
         if result is None:
-            # Same contract as the real tool: disconnected after flood
-            # avoidance → caller retries without flood avoidance.
-            return json.dumps({
-                "error": "no_path_found",
-                "reason": (
-                    "No connected route remains after flood-edge removal"
-                ),
-                "flooded_edges_removed": removed,
-            }, ensure_ascii=False)
+            if blocked is None:
+                return json.dumps({
+                    "error": "no_path_found",
+                    "reason": "No connected base route",
+                    "flooded_edges_removed": removed,
+                }, ensure_ascii=False)
+            fallback_args = dict(args)
+            fallback_args["avoid_polygon_path"] = ""
+            fallback = json.loads(self._fx_vec_shortest_path(fallback_args))
+            fallback["flooded_edges_removed"] = removed
+            fallback["route_avoids_flood"] = False
+            return json.dumps(fallback, ensure_ascii=False)
         total_m, legs = result
 
         coords = []
@@ -955,6 +1026,11 @@ class FakeMCP:
             },
             "node_count": len(legs) + 1,
             "flooded_edges_removed": removed,
+            "route_avoids_flood": blocked is not None,
+            "download_geometry": "origin_destination_corridor",
+            "corridor_half_width_km": float(
+                args.get("search_radius_km", 2.0)
+            ),
             "origin": {"lat": origin[0], "lon": origin[1]},
             "destination": {"lat": dest[0], "lon": dest[1]},
         }, ensure_ascii=False)
@@ -1033,13 +1109,22 @@ class _DemoEnv:
     handled by the same process.
     """
 
-    def __init__(self, env: dict[str, str | None]):
+    def __init__(
+        self,
+        env: dict[str, str | None],
+        force_keys: set[str] | None = None,
+    ):
         self._env = {k: v for k, v in env.items() if v is not None}
+        self._force_keys = force_keys or set()
         self._added: list[str] = []
+        self._replaced: dict[str, str] = {}
 
     def __enter__(self) -> "_DemoEnv":
         for key, value in self._env.items():
-            if key not in os.environ:
+            if key in self._force_keys and key in os.environ:
+                self._replaced[key] = os.environ[key]
+                os.environ[key] = value
+            elif key not in os.environ:
                 os.environ[key] = value
                 self._added.append(key)
         return self
@@ -1047,6 +1132,8 @@ class _DemoEnv:
     def __exit__(self, *_exc) -> None:
         for key in self._added:
             os.environ.pop(key, None)
+        for key, value in self._replaced.items():
+            os.environ[key] = value
 
 
 async def run_demo_assessment(
@@ -1056,6 +1143,10 @@ async def run_demo_assessment(
     event_date: str | None = None,
     vulnerability_weight: float | None = None,
     equity_threshold: float | None = None,
+    community_requirements: list[str] | None = None,
+    community_source: str | None = None,
+    community_note: str | None = None,
+    demo_scenario: str = "nominal",
 ) -> tuple[Any, Any]:
     """
     Run the full flood pipeline on FakeMCP; returns (SkillResult, RunState).
@@ -1064,10 +1155,30 @@ async def run_demo_assessment(
     network dependency. Pass a past event_date for historical replay
     (date-aware fixtures keep time alignment, so gates always pass).
     """
+    if demo_scenario not in DEMO_SCENARIOS:
+        raise ValueError(
+            f"Unknown demo scenario {demo_scenario!r}; expected one of: "
+            + ", ".join(sorted(DEMO_SCENARIOS))
+        )
+
     # Fill the JSON strings in a copy; never mutate the module-level
     # DEMO_ENV constant.
     demo_env = dict(DEMO_ENV)
-    demo_env["FLOOD_FUSION_SOURCES_JSON"] = json.dumps(FUSION_SOURCES)
+    fusion_sources = list(FUSION_SOURCES)
+    if demo_scenario == "fusion_conflict":
+        fusion_sources.append({
+            "name": "backup_gauge_conflict_demo",
+            "source_type": "hydrology",
+            "tool": "get_flood_observation",
+            "enabled": True,
+            "arguments": {
+                "station_id": "{station_id}",
+                "start_dt": "{event_start}",
+                "end_dt": "{event_end}",
+                "demo_conflict": True,
+            },
+        })
+    demo_env["FLOOD_FUSION_SOURCES_JSON"] = json.dumps(fusion_sources)
     demo_env["RESOURCE_DISCOVERY_ARGUMENTS_JSON"] = json.dumps(
         {"latitude": "{latitude}", "longitude": "{longitude}"}
     )
@@ -1090,21 +1201,43 @@ async def run_demo_assessment(
     from .experiment import ExperimentLogger
 
     overrides: dict[str, Any] = {}
-    if event_date:
-        overrides["event_date"] = event_date
+    effective_event_date = event_date
+    if demo_scenario == "stale_sar" and not effective_event_date:
+        effective_event_date = "2017-08-27"
+    if effective_event_date:
+        overrides["event_date"] = effective_event_date
     if vulnerability_weight is not None:
         overrides["vulnerability_weight"] = vulnerability_weight
     if equity_threshold is not None:
         overrides["equity_threshold"] = equity_threshold
+    if community_requirements:
+        overrides["community_requirements"] = community_requirements
+    if community_source:
+        overrides["community_source"] = community_source
+    if community_note:
+        overrides["community_note"] = community_note
 
     state = RunState(run_id=f"demo-{datetime.now(timezone.utc).strftime('%H%M%S')}")
-    mcp = FakeMCP()
+    if demo_scenario == "far_station":
+        target = "Seattle"
+        raw_task = "Assess flood around Seattle station 08077600"
+
+    mcp = FakeMCP(scenario=demo_scenario)
     hitl = AdaptiveHITL(state)
-    hitl.enable_web_mode()  # parameter checkpoints auto-accept defaults so the demo never blocks
+    # Fault demos must be deterministic and unattended. Safety-critical
+    # checkpoints therefore take their documented denial default rather
+    # than waiting 120 seconds for a web response.
+    hitl.enabled = False
+    hitl.enable_web_mode()
     # Demo parameters apply only during the run (FloodSkill reads env
     # vars at construction, so construction must stay inside the
     # context too); the context restores state on exceptions as well
-    with _DemoEnv(demo_env):
+    with _DemoEnv(
+        demo_env,
+        # The conflict preset adds a controlled second hydrology source;
+        # do not let a process-level fusion config hide that preset.
+        force_keys={"FLOOD_FUSION_SOURCES_JSON"},
+    ):
         skill = FloodSkill(
             state, Verifier(), hitl, mcp,
             ExperimentLogger(path=os.devnull),

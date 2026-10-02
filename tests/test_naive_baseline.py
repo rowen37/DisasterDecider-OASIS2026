@@ -226,7 +226,13 @@ async def test_baseline_comparison_row(tmp_path, monkeypatch, scenario):
     ours = await _run_ours(monkeypatch, tmp_path, scenario)
     _print_row(scenario, naive, ours, dashboard)
 
-    assert ours["completed"], f"[{scenario}] reference pipeline failed"
+    if scenario == "S3-far-station":
+        # The reference pipeline must fail closed before combining a
+        # Seattle target with the Friendswood gauge. In this row,
+        # non-completion is the expected safety outcome.
+        assert ours["completed"] is False
+    else:
+        assert ours["completed"], f"[{scenario}] reference pipeline failed"
     assert naive["status"] == "completed"
 
     if scenario == "S0-nominal":
@@ -253,6 +259,9 @@ async def test_baseline_comparison_row(tmp_path, monkeypatch, scenario):
         # naive recommends allocation ~3000 km from the gauge
         assert naive["allocation_emitted"] is True
         assert naive["station_distance_km"] > 1000
+        assert "STATION_TARGET_DISTANCE_EXCEEDED" in ours["issue_codes"]
+        assert ours["cdri_percent"] is None
+        assert ours["recommended"] is None
         assert ours["opt_status"] != "optimized"
     elif scenario == "S4-no-extent":
         # naive: dangerously optimistic zeros

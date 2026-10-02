@@ -64,6 +64,36 @@ def _pick_ranked(
     return min(eligible, key=key)
 
 
+def _pick_community_compatible(
+    plans: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Pick within the existing frontier; do not change Pareto objectives.
+
+    A confirmed mismatch is worse than missing capability data.  Unknown is
+    still penalized so that a plan with sourced evidence is preferred, but it
+    is never silently treated as a confirmed service failure.
+    """
+
+    eligible = [
+        plan
+        for plan in plans
+        if (_number(plan.get("community_requirements_total")) or 0) > 0
+    ]
+    if not eligible:
+        return None
+
+    def key(plan: dict[str, Any]) -> tuple[float, ...]:
+        return (
+            _number(plan.get("community_unmet_count")) or 0,
+            _number(plan.get("community_unknown_count")) or 0,
+            -(_number(plan.get("community_requirements_met")) or 0),
+            _number(plan.get("unmet_people")) or 0,
+            _number(plan.get("cost")) or 0,
+        )
+
+    return min(eligible, key=key)
+
+
 def build_plan_scenarios(
     frontier_curve: list[dict[str, Any]],
     recommended_plan_id: str | None,
@@ -77,6 +107,8 @@ def build_plan_scenarios(
     for profile in profiles or load_plan_profiles():
         if profile.get("selector") == "recommended":
             selected = by_id.get(str(recommended_plan_id)) or plans[0]
+        elif profile.get("selector") == "community_compatible":
+            selected = _pick_community_compatible(plans)
         else:
             selected = _pick_ranked(plans, profile.get("rank_by") or [])
         if selected is None:
@@ -97,6 +129,12 @@ def build_plan_scenarios(
                         "equity_gap",
                         "vulnerability_coverage",
                         "cost",
+                        "community_requirements_met",
+                        "community_requirements_total",
+                        "community_unmet_count",
+                        "community_unknown_count",
+                        "community_fit",
+                        "community_summary",
                     )
                 },
             }

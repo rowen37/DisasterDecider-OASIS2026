@@ -111,6 +111,20 @@ def classify(text: str) -> str:
     def _hit(words: tuple[str, ...]) -> bool:
         return any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in words)
 
+    def _matched_words(words: tuple[str, ...]) -> list[str]:
+        """Return the actual vocabulary items found in the request.
+
+        The old implementation recorded the registered skill name
+        (``flood``) when an unsupported word such as ``wildfire`` was
+        found.  That produced the misleading message "flood is not
+        supported" even though flood is the only supported hazard.
+        """
+        return [
+            word
+            for word in words
+            if re.search(rf"\b{re.escape(word)}\b", lowered)
+        ]
+
     matches: list[str] = []
     weak_only_matches: list[str] = []
     unsupported_hits: list[str] = []
@@ -120,8 +134,9 @@ def classify(text: str) -> str:
             matches.append(spec.hazard)
         elif _hit(spec.weak_keywords):
             weak_only_matches.append(spec.hazard)
-        if _hit(spec.unsupported_hazard_words):
-            unsupported_hits.append(spec.hazard)
+        unsupported_hits.extend(
+            _matched_words(spec.unsupported_hazard_words)
+        )
 
     if len(matches) > 1:
         raise ValueError(

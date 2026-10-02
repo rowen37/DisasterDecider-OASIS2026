@@ -475,6 +475,9 @@ def fuse_flood_evidence(
                     "source": observation.get(
                         "source"
                     ),
+                    "source_type": observation.get(
+                        "source_type"
+                    ),
                     "tool": observation.get(
                         "tool"
                     ),

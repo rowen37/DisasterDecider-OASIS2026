@@ -1,130 +1,156 @@
-#!/usr/bin/env python
-"""One-shot builder for the real-OSM road-network cache behind the demo rescue route.
+#!/usr/bin/env python3
+"""Build the local OSM road cache used by the offline demo.
 
-Usage (needs network; build once, then the demo reproduces offline):
-    .venv/bin/python scripts/build_demo_road_cache.py
+Usage (network required):
+    uv run python scripts/build_demo_road_cache.py
 
-Output: cache/demo_road_network.json
-    {"nodes": {id: [lat, lon]}, "edges": [[u, v, length_m, geom_or_null], ...]}
-where geom is the polyline shape of a simplified OSM edge
-([[lon, lat], ...], oriented u->v).
-
-app/demo_fixtures.py's _fx_vec_shortest_path runs Dijkstra on this cached
-network when present (same semantics as the real
-gis_vector_server.vec_shortest_path: endpoint snapping, flood-edge
-cutting, no_path_found fallback, conservative-speed travel time).
-Without the cache it falls back to the synthetic grid network, so the
-demo runs in every case.
+The generated cache is ignored by Git and can be refreshed when needed.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-import os
 import sys
+from datetime import date
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "mcp_servers",
-    ),
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "mcp_servers"))
 
 from app.utils import geodesic_km  # noqa: E402
-from gis_vector_server import _evacuation_edge_attributes  # noqa: E402
+from overpass_client import post_overpass_sync  # noqa: E402
 
-# Demo scenario endpoints: Friendswood assessment target -> Demo Hospital (POI fixture)
+
 ORIGIN = (29.5294, -95.2010)
-DEST = (29.506, -95.102)
-OUT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "cache", "demo_road_network.json",
-)
+DESTINATION = (29.506, -95.102)
+DEFAULT_OUTPUT = PROJECT_ROOT / "cache" / "demo_road_network.json"
 
-# Road-network corridor covering the endpoints' bounding box, padded ~1.5 km
-MARGIN_LAT = 1.5 / 110.54          # deg
-MARGIN_LON = 1.5 / 96.9            # deg (near lat 29.5)
-NORTH = max(ORIGIN[0], DEST[0]) + MARGIN_LAT
-SOUTH = min(ORIGIN[0], DEST[0]) - MARGIN_LAT
-EAST = max(ORIGIN[1], DEST[1]) + MARGIN_LON
-WEST = min(ORIGIN[1], DEST[1]) - MARGIN_LON
+# Friendswood demo corridor, padded by approximately 1.5 km.
+MARGIN_LAT = 1.5 / 110.54
+MARGIN_LON = 1.5 / 96.9
+NORTH = max(ORIGIN[0], DESTINATION[0]) + MARGIN_LAT
+SOUTH = min(ORIGIN[0], DESTINATION[0]) - MARGIN_LAT
+EAST = max(ORIGIN[1], DESTINATION[1]) + MARGIN_LON
+WEST = min(ORIGIN[1], DESTINATION[1]) - MARGIN_LON
 
 
-def main() -> None:
+def _edge_geometry(data, source, destination):
+    geometry = data.get("geometry")
+    if geometry is None:
+        return None
+    coordinates = [
+        [round(float(lon), 6), round(float(lat), 6)]
+        for lon, lat in geometry.coords
+    ]
+    source_xy = [round(source[1], 6), round(source[0], 6)]
+    destination_xy = [round(destination[1], 6), round(destination[0], 6)]
+    if len(coordinates) > 1 and coordinates[0] != source_xy:
+        if coordinates[0] == destination_xy:
+            coordinates.reverse()
+    return coordinates
+
+
+def build(output: Path) -> None:
     import osmnx as ox
+    from osmnx import _overpass as ox_overpass
 
-    try:  # osmnx 2.x
-        G = ox.graph_from_bbox(
-            bbox=(WEST, SOUTH, EAST, NORTH),
-            network_type="drive",
-            simplify=True,
+    # Use the same bounded, rotating Overpass client as the live MCP instead
+    # of OSMnx's single-host requester. This makes the refresh command robust
+    # to a public mirror being unavailable and avoids persistent workspace
+    # cache state.
+    previous_request = ox_overpass._overpass_request
+
+    def _rotating_request(data):
+        payload, _diagnostics = post_overpass_sync(
+            str(data.get("data") or ""),
+            server_timeout_s=60,
+            total_budget_s=180,
+            cache_dir=Path("/tmp/disaster-demo-road-overpass"),
+            ttl_s=0,
         )
-    except TypeError:  # osmnx 1.x
-        G = ox.graph_from_bbox(
-            NORTH, SOUTH, EAST, WEST,
-            network_type="drive",
-            simplify=True,
-        )
-    # Keep the directed graph: matches the real vec_shortest_path, preserving one-way semantics
+        return payload
+
+    ox_overpass._overpass_request = _rotating_request
+    try:
+        try:
+            graph = ox.graph_from_bbox(
+                bbox=(WEST, SOUTH, EAST, NORTH),
+                network_type="drive",
+                simplify=True,
+            )
+        except TypeError:  # osmnx 1.x compatibility
+            graph = ox.graph_from_bbox(
+                NORTH,
+                SOUTH,
+                EAST,
+                WEST,
+                network_type="drive",
+                simplify=True,
+            )
+    finally:
+        ox_overpass._overpass_request = previous_request
 
     nodes = {
-        str(n): [float(d["y"]), float(d["x"])]
-        for n, d in G.nodes(data=True)
+        str(node_id): [float(data["y"]), float(data["x"])]
+        for node_id, data in sorted(graph.nodes(data=True), key=lambda item: str(item[0]))
     }
     edges = []
-    for u, v, key, data in G.edges(keys=True, data=True):
-        geom = data.get("geometry")
-        if geom is not None:
-            coords = [[round(p[0], 6), round(p[1], 6)] for p in geom.coords]
-            # Ensure the geometry is oriented u->v
-            if [round(coords[0][0], 6), round(coords[0][1], 6)] != [
-                round(nodes[str(u)][1], 6), round(nodes[str(u)][0], 6)
-            ] and len(coords) > 1:
-                if (abs(coords[0][0] - nodes[str(v)][1]) < 1e-6
-                        and abs(coords[0][1] - nodes[str(v)][0]) < 1e-6):
-                    coords = coords[::-1]
-            length_m = float(data.get(
-                "length",
-                geodesic_km(
-                    nodes[str(u)][0], nodes[str(u)][1],
-                    nodes[str(v)][0], nodes[str(v)][1],
-                ) * 1000.0,
-            ))
-        else:
-            coords = None
-            length_m = float(data.get(
-                "length",
-                geodesic_km(
-                    nodes[str(u)][0], nodes[str(u)][1],
-                    nodes[str(v)][0], nodes[str(v)][1],
-                ) * 1000.0,
-            ))
-        attrs = _evacuation_edge_attributes(data)
-        attrs.update({
-            "blocked": False,
-            "osm_key": str(key),
-            "capacity_assumed": data.get("lanes") is None,
-        })
-        edges.append([str(u), str(v), round(length_m, 1), coords, attrs])
+    for source_id, destination_id, key, data in graph.edges(keys=True, data=True):
+        source = nodes[str(source_id)]
+        destination = nodes[str(destination_id)]
+        length_m = float(data.get(
+            "length",
+            geodesic_km(source[0], source[1], destination[0], destination[1])
+            * 1000.0,
+        ))
+        edges.append([
+            str(source_id),
+            str(destination_id),
+            round(length_m, 1),
+            _edge_geometry(data, source, destination),
+            str(key),
+        ])
+    edges.sort(key=lambda item: (item[0], item[1], item[4]))
 
     payload = {
+        "schema_version": 1,
         "meta": {
-            "source": "OpenStreetMap (ODbL) via osmnx, drive network, simplified",
+            "source": "OpenStreetMap (ODbL) via OSMnx",
+            "network_type": "drive",
+            "simplified": True,
+            "snapshot_date": date.today().isoformat(),
             "bbox": [WEST, SOUTH, EAST, NORTH],
-            "origin": ORIGIN,
-            "destination": DEST,
+            "origin": list(ORIGIN),
+            "destination": list(DESTINATION),
         },
         "nodes": nodes,
         "edges": edges,
     }
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False)
-    size_mb = os.path.getsize(OUT) / 1e6
-    print(f"saved {OUT}: {len(nodes)} nodes, {len(edges)} edges, {size_mb:.1f} MB")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    print(
+        f"saved {output}: {len(nodes)} nodes, {len(edges)} edges, "
+        f"{output.stat().st_size / 1e6:.1f} MB"
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help="output fixture path",
+    )
+    args = parser.parse_args()
+    build(args.output.resolve())
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

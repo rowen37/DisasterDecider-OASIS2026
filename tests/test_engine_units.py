@@ -5,6 +5,7 @@
 # FinalDecision output validation. Fully offline.
 # Run: python -m pytest tests/test_engine_units.py -v
 
+import asyncio
 import json
 import os
 import sys
@@ -23,9 +24,60 @@ from app.engine.geometry_engine import GeometryEngine      # noqa: E402
 from app.skills.master_router import MasterRouter          # noqa: E402
 from app.skills import registry as skill_registry          # noqa: E402
 from app.hitl import AdaptiveHITL                          # noqa: E402
-from app.models import RunState                            # noqa: E402
+from app.models import Location, RunState                  # noqa: E402
 from app.agent import FinalDecisionAgent                    # noqa: E402
 from app.skills.flood_skill import FloodSkill               # noqa: E402
+from app.skills.fusion_sources_skill import FusionSourcesSkill  # noqa: E402
+from app.verification import Verifier                       # noqa: E402
+
+
+def test_fusion_warning_radius_template_uses_runtime_policy(monkeypatch):
+    """The versioned live config must render on a clean checkout."""
+
+    class RecordingMCP:
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, tool, arguments, **_kwargs):
+            self.calls.append((tool, arguments))
+            return json.dumps({"status": "ok", "warnings": []})
+
+    class NullLogger:
+        def log(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setenv("NWS_WARNING_RADIUS_KM", "31")
+    mcp = RecordingMCP()
+    skill = FusionSourcesSkill(
+        RunState(run_id="warning-radius"),
+        Verifier(),
+        mcp,
+        NullLogger(),
+        flood_analysis_radius_km=10,
+        source_configs=[{
+            "name": "flood_warnings",
+            "source_type": "warning",
+            "tool": "get_flood_warnings",
+            "arguments": {
+                "latitude": "{latitude}",
+                "longitude": "{longitude}",
+                "radius_km": "{warning_radius_km}",
+            },
+        }],
+    )
+
+    observations = asyncio.run(skill.collect(
+        "Friendswood",
+        "08077600",
+        Location(name="Friendswood", latitude=29.5294, longitude=-95.201),
+    ))
+
+    assert len(observations) == 1
+    assert mcp.calls == [("get_flood_warnings", {
+        "latitude": 29.5294,
+        "longitude": -95.201,
+        "radius_km": 31.0,
+    })]
 
 
 # ------------------------------------------------------------------
@@ -389,7 +441,7 @@ def test_router_word_boundary_prevents_wildfire_misroute():
     router = MasterRouter()
     # A "river" substring match must not route wildfire queries into
     # FloodSkill
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="wildfire is not a supported hazard"):
         router.classify("wildfire crossed the river near Bastrop")
     with pytest.raises(ValueError):
         router.classify("fire situation at stage 2 of containment")
@@ -489,6 +541,13 @@ def test_extract_target_keeps_state_qualifier():
         "assess flooding near Manhattan using USGS station 06879650",
         "flood",
     ) == "Manhattan"
+    # Natural question suffixes describe the hazard state; they are not
+    # part of the place name sent to geocoding.
+    assert router.extract_target(
+        "Is the area around Friendswood flooding right now? "
+        "USGS station 08077600",
+        "flood",
+    ) == "Friendswood"
 
 
 def test_geocode_candidate_scoring_prefers_qualified_match():
