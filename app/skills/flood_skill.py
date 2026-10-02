@@ -436,6 +436,12 @@ threshold or validated model is present in the evidence.
         self.gis_search_radius_buildings_m = float(
             os.getenv("GIS_SEARCH_RADIUS_BUILDINGS_M", "3000")
         )
+        self.gis_building_tile_size_km = float(
+            os.getenv("GIS_BUILDING_TILE_SIZE_KM", "0.75")
+        )
+        self.gis_building_max_tiles = int(
+            os.getenv("GIS_BUILDING_MAX_TILES", "24")
+        )
         # Half-widths for a target-to-facility road corridor. These do not
         # change the separate 15/30 km facility service-area policy.
         self.gis_route_corridor_km = float(
@@ -2694,14 +2700,11 @@ threshold or validated model is present in the evidence.
 
                     # vec_intersect: flooded buildings. poi_search_osm
                     # cannot query by polygon, so buildings are fetched by
-                    # center point + radius, then intersected with the
-                    # flood boundary. A large-radius building query can be
-                    # very heavy downtown (tens of thousands of ways);
-                    # budget 90 s because public Overpass mirrors commonly
-                    # return slow 504s at peak (~30 s per failed attempt),
-                    # leaving room to rotate to a healthy mirror instead
-                    # of losing the whole building layer. The tool caps
-                    # itself at an 85 s wall clock.
+                    # flood polygon's intersecting grid cells, then screens
+                    # Overpass-provided building center points against the
+                    # flood boundary. Per-tile caching
+                    # avoids repeating a city-scale cold query. The caller
+                    # allows 90 s and the tool uses an 80 s total budget.
                     buildings_result = await self.mcp.call("poi_search_osm", {
                         "center_lat": location.latitude,
                         "center_lon": location.longitude,
@@ -2712,6 +2715,13 @@ threshold or validated model is present in the evidence.
                         # Request the complete building inventory within
                         # the configured survey radius instead.
                         "unlimited_results": True,
+                        # Query only the flood footprint's intersecting
+                        # grid cells. Each tile is independently cached;
+                        # the GIS server rejects partial tile completion
+                        # instead of reporting an incomplete count.
+                        "query_polygon_path": flood_boundary_path,
+                        "tile_size_km": self.gis_building_tile_size_km,
+                        "max_tiles": self.gis_building_max_tiles,
                     }, timeout=90.0, max_retries=1)
                     buildings_data = json.loads(buildings_result)
                     if (
@@ -2739,6 +2749,15 @@ threshold or validated model is present in the evidence.
                                 if affected_buildings_path:
                                     gis_results["affected_buildings_path"] = affected_buildings_path
                                     gis_results["stats"]["affected_buildings"] = intersect_data.get("intersected_count", 0)
+                                    gis_results["stats"]["affected_buildings_method"] = (
+                                        "osm_building_centers_within_flood_polygon"
+                                    )
+                                    gis_results["stats"]["building_query_mode"] = (
+                                        buildings_data.get("query_mode")
+                                    )
+                                    gis_results["stats"]["building_query_tiles"] = (
+                                        buildings_data.get("tile_count")
+                                    )
 
                     # vec_shortest_path: rescue route (the POI layer is
                     # allowed to fail fast; a bounded hospital,shelter query

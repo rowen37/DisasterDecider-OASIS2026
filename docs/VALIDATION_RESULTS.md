@@ -3,7 +3,7 @@
 Execution date: 2026-09-30.
 
 Repository regression check: 2026-10-02. A cache-free offline run completed
-with **130 passed** tests. This is separate from the dated real-service event
+with **133 passed** tests. This is separate from the dated real-service event
 records below; those external-service runs were not repeated during workspace
 cleanup.
 
@@ -47,9 +47,12 @@ heuristic. Capacity-constrained assignment recomputes coverage and unmet
 demand but does not replace that objective, so the two speed assumptions are
 not yet unified.
 
-It also requests the complete building inventory inside the configured
-near-field survey radius instead of accepting a silently truncated Overpass
-result. Repository regression status is recorded by the current
+It queries the complete building inventory in independently cached grid cells
+that intersect the operational flood polygon, rather than accepting a
+silently truncated radius result. A failed cell invalidates the building
+count instead of producing a partial total. The metric is explicitly a count
+of OSM building center points inside the flood polygon, not an intersection
+of full building footprints. Repository regression status is recorded by the current
 `uv run python -m pytest -q` output rather than a manually maintained test count. The
 suite includes the 15 km to 30 km facility fallback and route-production
 regression.

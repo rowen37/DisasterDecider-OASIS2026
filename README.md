@@ -166,9 +166,13 @@ End-to-end pipeline, fully auditable in the run log:
    corridor, expanding once to 4 km only when the base graph is disconnected.
    Flood-avoiding and accessibility-reference routes reuse that road graph.
    This 15/30 km policy applies only to the GIS facility/map-route layer.
-   The building layer is a separate default 3 km inventory query. It requests
-   all returned OSM buildings instead of silently truncating at a result cap,
-   then intersects them with the operational flood polygon.
+   The building layer covers the operational flood polygon with 0.75 km
+   metric grid cells (automatically enlarged to stay below 24 cells), queries
+   and caches each cell independently, deduplicates OSM IDs, and then counts
+   Overpass-provided building center points inside the flood polygon. This is
+   a centroid screen, not building-footprint overlap. If any cell fails, no
+   partial count is reported. Non-polygon callers retain the legacy radius
+   query.
 7. Pareto resource optimization with **capacity-constrained demand
    assignment**: exposed census-tract demand is assigned to eligible shelters
    and hospitals by minimum-cost flow using facility capacity and straight-line

@@ -251,6 +251,21 @@ def _cache_store(query: str, data: dict[str, Any], cache_dir: Path) -> None:
         pass
 
 
+def store_overpass_cache(
+    query: str,
+    data: dict[str, Any],
+    cache_dir: Path | None = None,
+) -> None:
+    """Store a complete response assembled from equivalent smaller queries.
+
+    This is used by callers that subdivide one spatial query, merge every
+    successful child response, and want later runs to reuse the complete
+    parent result. Partial responses must never be passed here.
+    """
+
+    _cache_store(query, data, cache_dir or _default_cache_dir())
+
+
 def _prune_cache(cache_dir: Path, limit: int = 256) -> None:
     """Prune the oldest cache files when there are too many (avoid unbounded
     growth in long-running processes).
@@ -426,8 +441,12 @@ async def post_overpass_async(
 
     def attempt_timeout() -> float:
         # Clamp a single attempt to the remaining budget: a hung request
-        # must not eat the total budget
-        return min(server_timeout_s + 15.0, max(5.0, remaining()))
+        # must not eat the total budget. With multiple mirrors, reserve half
+        # of the remaining time for the concurrent hedge phase.
+        available = remaining()
+        if len(eps) > 1:
+            available /= 2.0
+        return min(server_timeout_s + 15.0, max(5.0, available))
 
     permanent_failure = False
     try:
@@ -566,7 +585,10 @@ def post_overpass_sync(
         return deadline - time.monotonic()
 
     def attempt_timeout() -> float:
-        return min(server_timeout_s + 15.0, max(5.0, remaining()))
+        available = remaining()
+        if len(eps) > 1:
+            available /= 2.0
+        return min(server_timeout_s + 15.0, max(5.0, available))
 
     permanent_failure = False
     try:

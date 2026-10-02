@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 from gis_io import out_path as _out
@@ -23,13 +24,14 @@ from typing import Any
 
 import geopandas as gpd
 from pyproj import CRS, Geod
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, box
 from mcp.server.fastmcp import FastMCP
 
 from overpass_client import (
     OverpassError,
     configured_endpoints,
     post_overpass_sync,
+    store_overpass_cache,
 )
 from osm_labels import load_label_overrides, osm_display_label
 
@@ -96,6 +98,80 @@ def _metric_crs(gdf: gpd.GeoDataFrame, layer_path: str, tool: str) -> CRS:
             f"(tool={tool})"
         )
     return estimated
+
+
+def _polygon_query_tiles(
+    polygon_path: str,
+    tile_size_km: float,
+    max_tiles: int,
+) -> tuple[list[tuple[float, float, float, float]], float]:
+    """Cover a polygon with metric tiles and return WGS84 bboxes.
+
+    Only cells intersecting the polygon are retained. If the requested tile
+    size would exceed ``max_tiles``, cells are enlarged until the cap is met.
+    Tuples use Overpass bbox order: ``(south, west, north, east)``.
+    """
+
+    if not polygon_path or not os.path.exists(polygon_path):
+        raise ValueError("query_polygon_path does not exist")
+    if tile_size_km <= 0:
+        raise ValueError("tile_size_km must be greater than 0")
+    if max_tiles <= 0 or max_tiles > 100:
+        raise ValueError("max_tiles must be between 1 and 100")
+
+    polygon_gdf = _read_with_crs(polygon_path)
+    polygon_gdf = polygon_gdf[
+        polygon_gdf.geometry.notna() & ~polygon_gdf.geometry.is_empty
+    ].copy()
+    if polygon_gdf.empty:
+        raise ValueError("query_polygon_path contains no usable geometry")
+
+    metric_crs = _metric_crs(
+        polygon_gdf,
+        polygon_path,
+        "poi_search_osm",
+    )
+    flood_geom = polygon_gdf.to_crs(metric_crs).geometry.union_all()
+    min_x, min_y, max_x, max_y = flood_geom.bounds
+    tile_m = float(tile_size_km) * 1_000.0
+
+    def metric_tiles(size_m: float) -> list[Any]:
+        selected = []
+        x = min_x
+        while True:
+            right = min(x + size_m, max_x)
+            y = min_y
+            while True:
+                top = min(y + size_m, max_y)
+                cell = box(x, y, right, top)
+                if cell.intersects(flood_geom):
+                    selected.append(cell)
+                if top >= max_y:
+                    break
+                y = top
+            if right >= max_x:
+                break
+            x = right
+        return selected
+
+    tiles = metric_tiles(tile_m)
+    # Adapt to large or scattered footprints without silently dropping cells.
+    while len(tiles) > max_tiles:
+        tile_m *= max(1.1, math.sqrt(len(tiles) / max_tiles) * 1.05)
+        tiles = metric_tiles(tile_m)
+
+    tile_gdf = gpd.GeoDataFrame(geometry=tiles, crs=metric_crs).to_crs(WGS84)
+    bboxes = [
+        (
+            float(geom.bounds[1]),
+            float(geom.bounds[0]),
+            float(geom.bounds[3]),
+            float(geom.bounds[2]),
+        )
+        for geom in tile_gdf.geometry
+    ]
+    bboxes.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return bboxes, tile_m / 1_000.0
 
 
 @mcp.tool()
@@ -722,6 +798,9 @@ def poi_search_osm(
     output_path: str = "",
     max_results: int = 100,
     unlimited_results: bool = False,
+    query_polygon_path: str = "",
+    tile_size_km: float = 0.75,
+    max_tiles: int = 24,
 ) -> str:
     """
     Search OpenStreetMap amenity POIs through the public Overpass API.
@@ -754,61 +833,239 @@ def poi_search_osm(
                 "tool": "poi_search_osm",
             })
 
-        # "building" is a top-level OSM key, not an amenity value:
-        # querying node["amenity"="building"] matches nothing. Map it
-        # to way/relation["building"] selectors instead.
-        selectors: list[str] = []
-        for a in amenities:
-            r = int(radius_m)
-            if a == "building":
-                selectors.append(
-                    f'  way["building"](around:{r},{center_lat},{center_lon});'
-                )
-                selectors.append(
-                    f'  relation["building"](around:{r},{center_lat},{center_lon});'
-                )
-            else:
-                selectors.append(
-                    f'  node["amenity"="{a}"](around:{r},{center_lat},{center_lon});'
-                )
-                selectors.append(
-                    f'  way["amenity"="{a}"](around:{r},{center_lat},{center_lon});'
-                )
-
         output_clause = (
             "out center;"
             if unlimited_results
             else f"out center {int(max_results)};"
         )
-        query = (
-            '[out:json][timeout:30];\n'
-            '(\n'
-            + "\n".join(selectors) +
-            '\n);\n'
-            f'{output_clause}\n'
-        )
 
-        # Shared Overpass client: mirror rotation + cooldown + TTL cache +
-        # budget cap + stale-cache fallback when all mirrors fail. A 3 km
-        # building scan is a heavy query: public mirrors commonly "fail
-        # slowly" at peak (the server runs the full [timeout:30] before
-        # returning 504), so one slow failure costs ~30s. The caller
-        # (flood_skill GIS section) allows 90s for this tool: server
-        # [timeout:30], per-attempt <=45s, total budget 85s (room for
-        # 2-3 mirror rotations). With cross-process mirror health
-        # sharing, calls usually start directly on a healthy mirror.
-        data, diag = post_overpass_sync(
-            query,
-            server_timeout_s=30.0,
-            total_budget_s=85.0,
-        )
-        if diag.get("attempts"):
-            log.warning(
-                "poi_search_osm: overpass served by %s after %d failed "
-                "attempt(s): %s",
-                diag.get("endpoint"), len(diag["attempts"]), diag["attempts"],
+        def selectors_for(area: str) -> list[str]:
+            selectors: list[str] = []
+            for amenity in amenities:
+                # "building" is a top-level OSM key, not an amenity value.
+                if amenity == "building":
+                    selectors.extend([
+                        f'  way["building"]{area};',
+                        f'  relation["building"]{area};',
+                    ])
+                else:
+                    selectors.extend([
+                        f'  node["amenity"="{amenity}"]{area};',
+                        f'  way["amenity"="{amenity}"]{area};',
+                    ])
+            return selectors
+
+        tile_diagnostics: list[dict[str, Any]] = []
+        effective_tile_size_km = None
+
+        if query_polygon_path:
+            if amenities != ["building"]:
+                return _json({
+                    "error": (
+                        "query_polygon_path is currently supported only "
+                        "for amenity_types=building"
+                    ),
+                    "tool": "poi_search_osm",
+                })
+            bboxes, effective_tile_size_km = _polygon_query_tiles(
+                query_polygon_path,
+                tile_size_km,
+                int(max_tiles),
             )
-        elements = data.get("elements", [])
+            total_budget_s = max(
+                5.0,
+                float(os.getenv(
+                    "OSM_BUILDING_TILE_TOTAL_BUDGET_SECONDS",
+                    "80",
+                )),
+            )
+            deadline = time.monotonic() + total_budget_s
+            elements_by_id: dict[tuple[str, Any], dict[str, Any]] = {}
+            failed_tiles: list[dict[str, Any]] = []
+            building_cache_ttl_s = max(
+                0.0,
+                float(os.getenv(
+                    "OSM_BUILDING_TILE_CACHE_TTL_SECONDS",
+                    str(7 * 24 * 3600),
+                )),
+            )
+
+            for index, (south, west, north, east) in enumerate(bboxes):
+                remaining = deadline - time.monotonic()
+                if remaining < 5.0:
+                    failed_tiles.extend(
+                        {"tile_index": pending, "error": "budget_exhausted"}
+                        for pending in range(index, len(bboxes))
+                    )
+                    break
+
+                bbox = (
+                    f"({south:.7f},{west:.7f},"
+                    f"{north:.7f},{east:.7f})"
+                )
+                query = (
+                    '[out:json][timeout:15];\n(\n'
+                    + "\n".join(selectors_for(bbox))
+                    + '\n);\nout center;\n'
+                )
+                try:
+                    data, tile_diag = post_overpass_sync(
+                        query,
+                        server_timeout_s=15.0,
+                        total_budget_s=min(25.0, remaining),
+                        ttl_s=building_cache_ttl_s,
+                    )
+                except OverpassError as exc:
+                    # A dense or pathological tile can repeatedly time out
+                    # even when its neighbors succeed. Split that tile once,
+                    # require all four children, merge/dedupe their results,
+                    # then cache the complete aggregate under the parent
+                    # query key so future runs do not repeat the failed
+                    # parent request.
+                    mid_lat = (south + north) / 2.0
+                    mid_lon = (west + east) / 2.0
+                    child_bboxes = [
+                        (south, west, mid_lat, mid_lon),
+                        (south, mid_lon, mid_lat, east),
+                        (mid_lat, west, north, mid_lon),
+                        (mid_lat, mid_lon, north, east),
+                    ]
+                    child_elements: dict[
+                        tuple[str, Any], dict[str, Any]
+                    ] = {}
+                    child_diagnostics = []
+                    child_failures = []
+                    for child_index, child in enumerate(child_bboxes):
+                        child_remaining = deadline - time.monotonic()
+                        if child_remaining < 5.0:
+                            child_failures.append({
+                                "child_index": child_index,
+                                "error": "budget_exhausted",
+                            })
+                            continue
+                        child_s, child_w, child_n, child_e = child
+                        child_area = (
+                            f"({child_s:.7f},{child_w:.7f},"
+                            f"{child_n:.7f},{child_e:.7f})"
+                        )
+                        child_query = (
+                            '[out:json][timeout:15];\n(\n'
+                            + "\n".join(selectors_for(child_area))
+                            + '\n);\nout center;\n'
+                        )
+                        try:
+                            child_data, child_diag = post_overpass_sync(
+                                child_query,
+                                server_timeout_s=15.0,
+                                total_budget_s=min(
+                                    18.0,
+                                    child_remaining,
+                                ),
+                                ttl_s=building_cache_ttl_s,
+                            )
+                        except OverpassError as child_exc:
+                            child_failures.append({
+                                "child_index": child_index,
+                                "error": str(child_exc)[:300],
+                            })
+                            continue
+                        child_diagnostics.append({
+                            "child_index": child_index,
+                            "endpoint": child_diag.get("endpoint"),
+                            "cache_hit": bool(
+                                child_diag.get("cache_hit")
+                            ),
+                            "stale": bool(child_diag.get("stale")),
+                        })
+                        for element in child_data.get("elements", []):
+                            child_elements[(
+                                str(element.get("type")),
+                                element.get("id"),
+                            )] = element
+
+                    if child_failures:
+                        failed_tiles.append({
+                            "tile_index": index,
+                            "error": str(exc)[:300],
+                            "subtile_failures": child_failures,
+                        })
+                        continue
+
+                    data = {"elements": list(child_elements.values())}
+                    store_overpass_cache(query, data)
+                    tile_diag = {
+                        "endpoint": "subdivided-tiles",
+                        "cache_hit": False,
+                        "stale": any(
+                            item["stale"] for item in child_diagnostics
+                        ),
+                        "attempts": getattr(exc, "attempts", []),
+                        "subtiles": child_diagnostics,
+                    }
+
+                tile_diagnostics.append({
+                    "tile_index": index,
+                    "endpoint": tile_diag.get("endpoint"),
+                    "cache_hit": bool(tile_diag.get("cache_hit")),
+                    "stale": bool(tile_diag.get("stale")),
+                    "failed_attempts": len(
+                        tile_diag.get("attempts") or []
+                    ),
+                })
+                for element in data.get("elements", []):
+                    key = (
+                        str(element.get("type")),
+                        element.get("id"),
+                    )
+                    elements_by_id[key] = element
+
+            if failed_tiles:
+                return _json({
+                    "error": (
+                        "Flood-polygon building tiles did not all complete; "
+                        "no partial building count was accepted. Successful "
+                        "tiles were cached for the next attempt."
+                    ),
+                    "failed_tiles": failed_tiles,
+                    "completed_tiles": len(tile_diagnostics),
+                    "tile_count": len(bboxes),
+                    "tool": "poi_search_osm",
+                })
+
+            elements = list(elements_by_id.values())
+            diag = {
+                "endpoint": "polygon-tiles",
+                "cache_hit": bool(tile_diagnostics) and all(
+                    item["cache_hit"] for item in tile_diagnostics
+                ),
+                "stale": any(
+                    item["stale"] for item in tile_diagnostics
+                ),
+                "attempts": [],
+            }
+        else:
+            radius_area = (
+                f"(around:{int(radius_m)},{center_lat},{center_lon})"
+            )
+            query = (
+                '[out:json][timeout:30];\n(\n'
+                + "\n".join(selectors_for(radius_area))
+                + f'\n);\n{output_clause}\n'
+            )
+            data, diag = post_overpass_sync(
+                query,
+                server_timeout_s=30.0,
+                total_budget_s=85.0,
+            )
+            if diag.get("attempts"):
+                log.warning(
+                    "poi_search_osm: overpass served by %s after %d failed "
+                    "attempt(s): %s",
+                    diag.get("endpoint"),
+                    len(diag["attempts"]),
+                    diag["attempts"],
+                )
+            elements = data.get("elements", [])
 
         features: list[dict[str, Any]] = []
         by_type: dict[str, int] = {}
@@ -884,6 +1141,17 @@ def poi_search_osm(
             "feature_list": feature_list,
             "search_center": {"lat": center_lat, "lon": center_lon},
             "search_radius_m": radius_m,
+            "query_mode": (
+                "flood_polygon_tiles"
+                if query_polygon_path
+                else "center_radius"
+            ),
+            "query_polygon_path": query_polygon_path or None,
+            "tile_count": (
+                len(tile_diagnostics) if query_polygon_path else 0
+            ),
+            "tile_size_km_effective": effective_tile_size_km,
+            "tile_diagnostics": tile_diagnostics,
             "result_limit": None if unlimited_results else int(max_results),
             "results_truncated": (
                 False
