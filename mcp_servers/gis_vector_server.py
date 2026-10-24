@@ -401,6 +401,56 @@ def vec_count_within(
         return _json({"error": str(exc), "tool": "vec_count_within"})
 
 
+def _route_from_road_db(
+    corridor_polygon_fn: Any,
+    corridor_widths: list[float],
+    travel_mode: str,
+    origin_lon: float,
+    origin_lat: float,
+    dest_lon: float,
+    dest_lat: float,
+) -> tuple[Any, Any, Any, float, str] | None:
+    """Try to answer a route entirely from the local road-network store.
+
+    Returns ``(graph, orig_node, dest_node, corridor_width_km, region)``
+    when a stored region covers the widest corridor and contains a
+    connected base route; None otherwise (any failure just means the
+    caller falls back to the live Overpass download path).
+    """
+    try:
+        import networkx as nx
+        import osmnx as ox
+
+        import road_network_store
+    except ImportError:
+        return None
+
+    try:
+        widest_bbox = corridor_polygon_fn(max(corridor_widths)).bounds
+        entry = road_network_store.covering_region(widest_bbox, travel_mode)
+        if entry is None:
+            return None
+        graph = road_network_store.load_graph(entry["graphml_path"])
+        for width_km in corridor_widths:
+            subgraph = road_network_store.corridor_subgraph(
+                graph, corridor_polygon_fn(width_km)
+            )
+            if subgraph is None:
+                continue
+            orig = ox.distance.nearest_nodes(subgraph, origin_lon, origin_lat)
+            dest = ox.distance.nearest_nodes(subgraph, dest_lon, dest_lat)
+            if nx.has_path(subgraph, orig, dest):
+                log.info(
+                    "Route served from local road-network store region=%s "
+                    "mode=%s corridor_half_width=%.1fkm",
+                    entry["region"], travel_mode, width_km,
+                )
+                return subgraph, orig, dest, width_km, str(entry["region"])
+    except Exception as exc:
+        log.warning("Local road-network store attempt failed: %s", exc)
+    return None
+
+
 @mcp.tool()
 def vec_shortest_path(
     origin_lat: float,
@@ -524,6 +574,14 @@ def vec_shortest_path(
             if width not in corridor_widths:
                 corridor_widths.append(width)
 
+        def _corridor_polygon(width_km: float):
+            return (
+                route_line.to_crs(route_crs)
+                .geometry.buffer(width_km * 1_000.0)
+                .to_crs(WGS84)
+                .iloc[0]
+            )
+
         G = None
         orig_node = None
         dest_node = None
@@ -532,140 +590,160 @@ def vec_shortest_path(
         download_count = 0
         successful_endpoint: str | None = None
         downloaded_graph = False
-        # OSMnx's private requester sleeps 55 seconds and recursively retries
-        # the same host on every 429/504. Replace only that request function
-        # for this bounded route call with the project's shared client. OSMnx
-        # still builds/simplifies the graph; HTTP now obeys our per-attempt
-        # budget and selected mirror.
-        from osmnx import _overpass as ox_overpass
+        graph_source = "overpass_live"
+        road_db_region: str | None = None
 
-        active_route_endpoint: dict[str, str | None] = {"value": None}
-
-        def _bounded_route_overpass(data: Any) -> dict[str, Any]:
-            endpoint = active_route_endpoint["value"]
-            if not endpoint:
-                raise OverpassError("No active route Overpass endpoint")
-            query = str(data.get("data") or "")
-            payload, _diag = post_overpass_sync(
-                query,
-                server_timeout_s=route_request_timeout,
-                total_budget_s=route_request_timeout,
-                endpoints=[endpoint],
+        # Local road-network store first: for a corridor inside a stored
+        # region this answers offline in milliseconds; None falls through
+        # to the bounded live download below, unchanged.
+        local_route = _route_from_road_db(
+            _corridor_polygon,
+            corridor_widths,
+            travel_mode,
+            origin_lon,
+            origin_lat,
+            dest_lon,
+            dest_lat,
+        )
+        if local_route is not None:
+            G, orig_node, dest_node, used_corridor_km, road_db_region = (
+                local_route
             )
-            return payload
+            graph_source = "local_road_db"
+        else:
+            # OSMnx's private requester sleeps 55 seconds and recursively
+            # retries the same host on every 429/504. Replace only that
+            # request function for this bounded route call with the
+            # project's shared client. OSMnx still builds/simplifies the
+            # graph; HTTP now obeys our per-attempt budget and mirror.
+            from osmnx import _overpass as ox_overpass
 
-        previous_overpass_url = ox.settings.overpass_url
-        previous_request_timeout = ox.settings.requests_timeout
-        previous_rate_limit = ox.settings.overpass_rate_limit
-        previous_overpass_request = ox_overpass._overpass_request
-        try:
-            ox.settings.requests_timeout = route_query_timeout
-            # Avoid a separate /status wait per mirror. The route layer has a
-            # strict two-download budget instead of waiting for public slots.
-            ox.settings.overpass_rate_limit = False
-            ox_overpass._overpass_request = _bounded_route_overpass
+            active_route_endpoint: dict[str, str | None] = {"value": None}
 
-            for width_km in corridor_widths:
-                if download_count >= route_max_downloads:
-                    break
-                corridor = (
-                    route_line.to_crs(route_crs)
-                    .geometry.buffer(width_km * 1_000.0)
-                    .to_crs(WGS84)
-                    .iloc[0]
+            def _bounded_route_overpass(data: Any) -> dict[str, Any]:
+                endpoint = active_route_endpoint["value"]
+                if not endpoint:
+                    raise OverpassError("No active route Overpass endpoint")
+                query = str(data.get("data") or "")
+                payload, _diag = post_overpass_sync(
+                    query,
+                    server_timeout_s=route_request_timeout,
+                    total_budget_s=route_request_timeout,
+                    endpoints=[endpoint],
                 )
+                return payload
 
-                # A transport/server failure rotates to the next mirror at
-                # the same width. A successfully downloaded but disconnected
-                # graph spends the one remaining attempt widening the same
-                # corridor, because changing mirrors cannot change topology.
-                if successful_endpoint:
-                    endpoints_for_width = [successful_endpoint]
-                else:
-                    endpoints_for_width = route_endpoints[download_count:]
+            previous_overpass_url = ox.settings.overpass_url
+            previous_request_timeout = ox.settings.requests_timeout
+            previous_rate_limit = ox.settings.overpass_rate_limit
+            previous_overpass_request = ox_overpass._overpass_request
+            try:
+                ox.settings.requests_timeout = route_query_timeout
+                # Avoid a separate /status wait per mirror. The route layer
+                # has a strict two-download budget instead of waiting for
+                # public slots.
+                ox.settings.overpass_rate_limit = False
+                ox_overpass._overpass_request = _bounded_route_overpass
 
-                candidate = None
-                candidate_endpoint = None
-                for endpoint in endpoints_for_width:
+                for width_km in corridor_widths:
                     if download_count >= route_max_downloads:
                         break
-                    download_count += 1
-                    active_route_endpoint["value"] = endpoint
-                    ox.settings.overpass_url = _osmnx_overpass_base(endpoint)
-                    log.info(
-                        "Downloading OSM route corridor length=%.1fkm "
-                        "half_width=%.1fkm endpoint=%s attempt=%d/%d",
-                        straight_m / 1_000.0,
-                        width_km,
-                        endpoint,
-                        download_count,
-                        route_max_downloads,
-                    )
-                    try:
-                        candidate = ox.graph_from_polygon(
-                            corridor,
-                            network_type=travel_mode,
-                            simplify=True,
-                            retain_all=True,
-                            truncate_by_edge=True,
+                    corridor = _corridor_polygon(width_km)
+
+                    # A transport/server failure rotates to the next mirror
+                    # at the same width. A successfully downloaded but
+                    # disconnected graph spends the one remaining attempt
+                    # widening the same corridor, because changing mirrors
+                    # cannot change topology.
+                    if successful_endpoint:
+                        endpoints_for_width = [successful_endpoint]
+                    else:
+                        endpoints_for_width = route_endpoints[download_count:]
+
+                    candidate = None
+                    candidate_endpoint = None
+                    for endpoint in endpoints_for_width:
+                        if download_count >= route_max_downloads:
+                            break
+                        download_count += 1
+                        active_route_endpoint["value"] = endpoint
+                        ox.settings.overpass_url = _osmnx_overpass_base(endpoint)
+                        log.info(
+                            "Downloading OSM route corridor length=%.1fkm "
+                            "half_width=%.1fkm endpoint=%s attempt=%d/%d",
+                            straight_m / 1_000.0,
+                            width_km,
+                            endpoint,
+                            download_count,
+                            route_max_downloads,
                         )
-                    except Exception as endpoint_exc:
+                        try:
+                            candidate = ox.graph_from_polygon(
+                                corridor,
+                                network_type=travel_mode,
+                                simplify=True,
+                                retain_all=True,
+                                truncate_by_edge=True,
+                            )
+                        except Exception as endpoint_exc:
+                            route_overpass_attempts.append({
+                                "endpoint": endpoint,
+                                "corridor_half_width_km": width_km,
+                                "status": "failed",
+                                "error": str(endpoint_exc)[:240],
+                            })
+                            log.warning(
+                                "Route Overpass mirror failed (%s): %s",
+                                endpoint,
+                                endpoint_exc,
+                            )
+                            candidate = None
+                            # A 400 response means Overpass rejected the
+                            # query itself. Sending the same invalid query
+                            # to another mirror only adds delay and cannot
+                            # recover it.
+                            if str(endpoint_exc).startswith(
+                                "Overpass rejected the query"
+                            ):
+                                break
+                            continue
+
+                        candidate_endpoint = endpoint
+                        successful_endpoint = endpoint
+                        downloaded_graph = True
                         route_overpass_attempts.append({
                             "endpoint": endpoint,
                             "corridor_half_width_km": width_km,
-                            "status": "failed",
-                            "error": str(endpoint_exc)[:240],
+                            "status": "downloaded",
                         })
-                        log.warning(
-                            "Route Overpass mirror failed (%s): %s",
-                            endpoint,
-                            endpoint_exc,
-                        )
-                        candidate = None
-                        # A 400 response means Overpass rejected the query
-                        # itself. Sending the same invalid query to another
-                        # mirror only adds delay and cannot recover it.
-                        if str(endpoint_exc).startswith(
-                            "Overpass rejected the query"
-                        ):
-                            break
-                        continue
+                        break
 
-                    candidate_endpoint = endpoint
-                    successful_endpoint = endpoint
-                    downloaded_graph = True
-                    route_overpass_attempts.append({
-                        "endpoint": endpoint,
-                        "corridor_half_width_km": width_km,
-                        "status": "downloaded",
-                    })
-                    break
+                    if candidate is None:
+                        break
 
-                if candidate is None:
-                    break
-
-                candidate_orig = ox.distance.nearest_nodes(
-                    candidate, origin_lon, origin_lat
-                )
-                candidate_dest = ox.distance.nearest_nodes(
-                    candidate, dest_lon, dest_lat
-                )
-                if nx.has_path(candidate, candidate_orig, candidate_dest):
-                    G = candidate
-                    orig_node = candidate_orig
-                    dest_node = candidate_dest
-                    used_corridor_km = width_km
-                    successful_endpoint = candidate_endpoint
-                    break
-                log.warning(
-                    "No connected base route in %.1fkm corridor; expanding once",
-                    width_km,
-                )
-        finally:
-            ox.settings.overpass_url = previous_overpass_url
-            ox.settings.requests_timeout = previous_request_timeout
-            ox.settings.overpass_rate_limit = previous_rate_limit
-            ox_overpass._overpass_request = previous_overpass_request
+                    candidate_orig = ox.distance.nearest_nodes(
+                        candidate, origin_lon, origin_lat
+                    )
+                    candidate_dest = ox.distance.nearest_nodes(
+                        candidate, dest_lon, dest_lat
+                    )
+                    if nx.has_path(candidate, candidate_orig, candidate_dest):
+                        G = candidate
+                        orig_node = candidate_orig
+                        dest_node = candidate_dest
+                        used_corridor_km = width_km
+                        successful_endpoint = candidate_endpoint
+                        break
+                    log.warning(
+                        "No connected base route in %.1fkm corridor; "
+                        "expanding once",
+                        width_km,
+                    )
+            finally:
+                ox.settings.overpass_url = previous_overpass_url
+                ox.settings.requests_timeout = previous_request_timeout
+                ox.settings.overpass_rate_limit = previous_rate_limit
+                ox_overpass._overpass_request = previous_overpass_request
 
         if G is None or orig_node is None or dest_node is None:
             if not downloaded_graph:
@@ -776,6 +854,8 @@ def vec_shortest_path(
             ],
             "overpass_endpoint": successful_endpoint,
             "overpass_attempts": route_overpass_attempts,
+            "graph_source": graph_source,
+            "road_db_region": road_db_region,
             "origin": {"lat": origin_lat, "lon": origin_lon},
             "destination": {"lat": dest_lat, "lon": dest_lon},
             "_meta": {
@@ -787,6 +867,148 @@ def vec_shortest_path(
     except Exception as exc:
         log.exception("vec_shortest_path failed")
         return _json({"error": str(exc), "tool": "vec_shortest_path"})
+
+
+# Amenity values stored in the local POI store's facilities layer; only
+# fully-covered amenity sets are served from disk ("building" and any
+# unlisted value stay on live Overpass).
+_POI_STORE_AMENITIES = {
+    "hospital", "fire_station", "police", "school",
+    "shelter", "ambulance_station",
+}
+
+
+def _poi_elements_from_store(
+    center_lat: float,
+    center_lon: float,
+    radius_m: float,
+    amenities: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Answer a center-radius amenity POI search from the local POI store,
+    or None when any requested amenity is not stored or no stored region
+    covers the query circle.
+
+    Returned elements are shaped like live Overpass `out center` elements
+    (nodes carry lat/lon; ways carry a center subobject) so the feature
+    building loop is shared. Elements are sorted by distance, a
+    deterministic stand-in for Overpass's arbitrary order.
+    """
+    try:
+        import poi_store
+    except ImportError:
+        return None
+    try:
+        if not set(amenities) <= _POI_STORE_AMENITIES:
+            return None
+        entry = poi_store.covering_region(
+            poi_store.circle_bbox(center_lat, center_lon, radius_m),
+            poi_store.FACILITIES_LAYER,
+        )
+        if entry is None:
+            return None
+        records = poi_store.elements_within_radius(
+            poi_store.load_elements(entry), center_lat, center_lon, radius_m
+        )
+        wanted = set(amenities)
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for rec in records:
+            tags = rec.get("tags") or {}
+            if tags.get("amenity") not in wanted:
+                continue
+            lat, lon = rec.get("lat"), rec.get("lon")
+            element: dict[str, Any] = {
+                "type": rec.get("type"),
+                "id": rec.get("id"),
+                "tags": tags,
+            }
+            if element["type"] == "node":
+                element["lat"], element["lon"] = lat, lon
+            else:
+                element["center"] = {"lat": lat, "lon": lon}
+            ranked.append((
+                poi_store.haversine_m(center_lat, center_lon, lat, lon),
+                element,
+            ))
+        ranked.sort(key=lambda item: item[0])
+        log.info(
+            "poi_search_osm served from local POI store region=%s "
+            "(%d within %.1fkm)",
+            entry["region"], len(ranked), radius_m / 1000.0,
+        )
+        return (
+            [element for _, element in ranked],
+            {
+                "endpoint": f"local-poi-store:{entry['region']}",
+                "cache_hit": True,
+                "stale": False,
+                "attempts": [],
+                "local_store": True,
+                "radius_filter": "center",
+            },
+        )
+    except Exception as exc:
+        log.warning("poi_search_osm local POI store attempt failed: %s", exc)
+        return None
+
+
+def _buildings_from_store_by_polygon(
+    query_polygon_path: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Answer a flood-polygon building search from the local POI store, or
+    None when no stored region covers the polygon's bbox (fall back to
+    live tiled Overpass).
+
+    Semantics match the live tiled flow exactly: building ways reduced to
+    their center point (`out center`), kept when the center lies inside
+    the query polygon."""
+    try:
+        import poi_store
+        from shapely.prepared import prep
+
+        if not query_polygon_path or not os.path.exists(query_polygon_path):
+            return None  # the live path reports the validation error
+        polygon_gdf = _read_with_crs(query_polygon_path).to_crs(WGS84)
+        if polygon_gdf.empty:
+            return None
+        polygon = polygon_gdf.geometry.union_all()
+        minx, miny, maxx, maxy = polygon.bounds
+        entry = poi_store.covering_region(
+            (minx, miny, maxx, maxy), poi_store.BUILDINGS_LAYER
+        )
+        if entry is None:
+            return None
+        prepared = prep(polygon)
+        elements: list[dict[str, Any]] = []
+        for rec in poi_store.load_elements(entry):
+            lon, lat = rec.get("lon"), rec.get("lat")
+            if lon is None or lat is None:
+                continue
+            if not (minx <= lon <= maxx and miny <= lat <= maxy):
+                continue
+            if prepared.contains(Point(float(lon), float(lat))):
+                elements.append({
+                    "type": "way",
+                    "id": rec.get("id"),
+                    "center": {"lat": lat, "lon": lon},
+                    "tags": rec.get("tags") or {},
+                })
+        log.info(
+            "poi_search_osm buildings served from local POI store "
+            "region=%s (%d inside polygon)",
+            entry["region"], len(elements),
+        )
+        return elements, {
+            "endpoint": f"local-poi-store:{entry['region']}",
+            "cache_hit": True,
+            "stale": False,
+            "attempts": [],
+            "local_store": True,
+        }
+    except Exception as exc:
+        log.warning(
+            "poi_search_osm buildings store attempt failed: %s", exc
+        )
+        return None
 
 
 @mcp.tool()
@@ -867,10 +1089,19 @@ def poi_search_osm(
                     ),
                     "tool": "poi_search_osm",
                 })
-            bboxes, effective_tile_size_km = _polygon_query_tiles(
-                query_polygon_path,
-                tile_size_km,
-                int(max_tiles),
+            # Local buildings store first: identical center-in-polygon
+            # semantics with zero Overpass tiling. None -> live tiles.
+            local_buildings = _buildings_from_store_by_polygon(
+                query_polygon_path
+            )
+            bboxes, effective_tile_size_km = (
+                ([], None)
+                if local_buildings is not None
+                else _polygon_query_tiles(
+                    query_polygon_path,
+                    tile_size_km,
+                    int(max_tiles),
+                )
             )
             total_budget_s = max(
                 5.0,
@@ -1032,40 +1263,54 @@ def poi_search_osm(
                     "tool": "poi_search_osm",
                 })
 
-            elements = list(elements_by_id.values())
-            diag = {
-                "endpoint": "polygon-tiles",
-                "cache_hit": bool(tile_diagnostics) and all(
-                    item["cache_hit"] for item in tile_diagnostics
-                ),
-                "stale": any(
-                    item["stale"] for item in tile_diagnostics
-                ),
-                "attempts": [],
-            }
+            if local_buildings is not None:
+                elements, diag = local_buildings
+            else:
+                elements = list(elements_by_id.values())
+                diag = {
+                    "endpoint": "polygon-tiles",
+                    "cache_hit": bool(tile_diagnostics) and all(
+                        item["cache_hit"] for item in tile_diagnostics
+                    ),
+                    "stale": any(
+                        item["stale"] for item in tile_diagnostics
+                    ),
+                    "attempts": [],
+                }
         else:
-            radius_area = (
-                f"(around:{int(radius_m)},{center_lat},{center_lon})"
+            local = _poi_elements_from_store(
+                center_lat, center_lon, radius_m, amenities
             )
-            query = (
-                '[out:json][timeout:30];\n(\n'
-                + "\n".join(selectors_for(radius_area))
-                + f'\n);\n{output_clause}\n'
-            )
-            data, diag = post_overpass_sync(
-                query,
-                server_timeout_s=30.0,
-                total_budget_s=85.0,
-            )
-            if diag.get("attempts"):
-                log.warning(
-                    "poi_search_osm: overpass served by %s after %d failed "
-                    "attempt(s): %s",
-                    diag.get("endpoint"),
-                    len(diag["attempts"]),
-                    diag["attempts"],
+            if local is not None:
+                elements, diag = local
+                # Live Overpass caps server-side via `out center N`; apply
+                # the same cap to the distance-ranked local results.
+                if not unlimited_results:
+                    elements = elements[: int(max_results)]
+            else:
+                radius_area = (
+                    f"(around:{int(radius_m)},{center_lat},{center_lon})"
                 )
-            elements = data.get("elements", [])
+                query = (
+                    '[out:json][timeout:30];\n(\n'
+                    + "\n".join(selectors_for(radius_area))
+                    + f'\n);\n{output_clause}\n'
+                )
+                data, diag = post_overpass_sync(
+                    query,
+                    server_timeout_s=30.0,
+                    total_budget_s=85.0,
+                    ttl_s=24 * 3600.0,
+                )
+                if diag.get("attempts"):
+                    log.warning(
+                        "poi_search_osm: overpass served by %s after %d "
+                        "failed attempt(s): %s",
+                        diag.get("endpoint"),
+                        len(diag["attempts"]),
+                        diag["attempts"],
+                    )
+                elements = data.get("elements", [])
 
         features: list[dict[str, Any]] = []
         by_type: dict[str, int] = {}

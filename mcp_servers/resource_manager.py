@@ -29,6 +29,7 @@ from mcp.server.fastmcp import FastMCP
 
 from overpass_client import OverpassError, post_overpass_async
 from osm_labels import load_label_overrides, osm_display_label
+from poi_store import resolve_center
 
 mcp = FastMCP("Resource Manager")
 
@@ -126,13 +127,128 @@ def _capacity_for(kind: str, tags: dict, manual: dict) -> tuple[float, bool]:
     return 1.0, True
 
 
+_KIND_BY_AMENITY = {
+    "hospital": "hospital",
+    "fire_station": "fire_station",
+    "police": "police",
+    "shelter": "shelter",
+    "ambulance_station": "ambulance_station",
+}
+
+
+def _facility_from_element(
+    el: dict, latitude: float, longitude: float, label_overrides: dict
+) -> dict | None:
+    """Map one normalized Overpass element (resolved lat/lon, see
+    poi_store.resolve_center) to a facility record, or None if it is not
+    one of the emergency resource kinds."""
+    tags = el.get("tags", {}) or {}
+    kind = _KIND_BY_AMENITY.get(tags.get("amenity", ""))
+    if not kind and tags.get("emergency") == "assembly_point":
+        kind = "shelter"
+    if not kind:
+        return None
+    lat, lon = el.get("lat"), el.get("lon")
+    if lat is None or lon is None:
+        return None
+    label = osm_display_label(
+        tags,
+        feature_type=kind,
+        osm_type=str(el.get("type") or "element"),
+        osm_id=el.get("id"),
+        lat=float(lat),
+        lon=float(lon),
+        overrides=label_overrides,
+    )
+    return {
+        "facility_id": f"osm:{el.get('type', 'element')}:{el.get('id')}",
+        "kind": kind,
+        "name": label["label"],
+        "address": label["address"],
+        "label_source": label["label_source"],
+        "lat": lat,
+        "lon": lon,
+        "distance_km": round(
+            _haversine_km(latitude, longitude, lat, lon), 2
+        ),
+        "tags": {
+            k: tags[k]
+            for k in (
+                "beds", "capacity", "ambulances", "phone",
+                "amenity", "wheelchair", "opening_hours", "emergency",
+                "shelter_type", "social_facility:for",
+            )
+            if k in tags
+        },
+    }
+
+
+def _facilities_from_store(
+    latitude: float, longitude: float, radius_m: float
+) -> tuple[list[dict], dict] | None:
+    """Answer the facility query from the local POI store when a stored
+    region covers the whole query circle; None falls back to live."""
+    try:
+        import poi_store
+    except ImportError:
+        return None
+    try:
+        entry = poi_store.covering_region(
+            poi_store.circle_bbox(latitude, longitude, radius_m),
+            poi_store.FACILITIES_LAYER,
+        )
+        if entry is None:
+            return None
+        elements = poi_store.elements_within_radius(
+            poi_store.load_elements(entry), latitude, longitude, radius_m
+        )
+        label_overrides = load_label_overrides()
+        facilities = [
+            facility
+            for el in elements
+            if (
+                facility := _facility_from_element(
+                    el, latitude, longitude, label_overrides
+                )
+            )
+            is not None
+        ]
+        print(
+            f"[resource_manager] facilities served from local POI store "
+            f"region={entry['region']} ({len(facilities)} within "
+            f"{radius_m / 1000:.0f}km)",
+            file=sys.stderr,
+        )
+        return facilities, {
+            "endpoint": f"local-poi-store:{entry['region']}",
+            "cache_hit": True,
+            "stale": False,
+            "attempts": [],
+            "local_store": True,
+            "radius_filter": "center",
+        }
+    except Exception as exc:
+        print(
+            f"[resource_manager] local POI store attempt failed: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 async def _fetch_osm_facilities(
     latitude: float,
     longitude: float,
     radius_m: float,
 ) -> tuple[list[dict], dict]:
     """Return (facility list, Overpass diagnostics). Diagnostics are
-    disclosed in the output for provenance."""
+    disclosed in the output for provenance. The local POI store is tried
+    first; live Overpass serves uncovered regions (24h TTL - emergency
+    facility data changes on the order of days, and the TTL cache makes
+    repeated experiments free)."""
+    local = _facilities_from_store(latitude, longitude, radius_m)
+    if local is not None:
+        return local
+
     selectors = "\n".join(
         q.format(r=int(radius_m), lat=latitude, lon=longitude)
         for q in FACILITY_QUERIES.values()
@@ -149,6 +265,7 @@ async def _fetch_osm_facilities(
             query,
             server_timeout_s=45.0,
             total_budget_s=80.0,
+            ttl_s=24 * 3600.0,
         )
     except OverpassError as exc:
         print(
@@ -171,60 +288,17 @@ async def _fetch_osm_facilities(
             file=sys.stderr,
         )
 
-    kind_by_tag = {
-        "hospital": "hospital",
-        "fire_station": "fire_station",
-        "police": "police",
-        "shelter": "shelter",
-        "ambulance_station": "ambulance_station",
-    }
-
-    facilities = []
     label_overrides = load_label_overrides()
-    for el in data.get("elements", []):
-        tags = el.get("tags", {}) or {}
-        kind = kind_by_tag.get(tags.get("amenity", ""))
-        if not kind and tags.get("emergency") == "assembly_point":
-            kind = "shelter"
-        if not kind:
+    facilities = []
+    for raw in data.get("elements", []):
+        el = resolve_center(raw)
+        if el is None:
             continue
-        center = el.get("center", {})
-        lat = el.get("lat") or center.get("lat")
-        lon = el.get("lon") or center.get("lon")
-        if lat is None or lon is None:
-            continue
-        label = osm_display_label(
-            tags,
-            feature_type=kind,
-            osm_type=str(el.get("type") or "element"),
-            osm_id=el.get("id"),
-            lat=float(lat),
-            lon=float(lon),
-            overrides=label_overrides,
+        facility = _facility_from_element(
+            el, latitude, longitude, label_overrides
         )
-        facilities.append(
-            {
-                "facility_id": f"osm:{el.get('type', 'element')}:{el.get('id')}",
-                "kind": kind,
-                "name": label["label"],
-                "address": label["address"],
-                "label_source": label["label_source"],
-                "lat": lat,
-                "lon": lon,
-                "distance_km": round(
-                    _haversine_km(latitude, longitude, lat, lon), 2
-                ),
-                "tags": {
-                    k: tags[k]
-                    for k in (
-                        "beds", "capacity", "ambulances", "phone",
-                        "amenity", "wheelchair", "opening_hours", "emergency",
-                        "shelter_type", "social_facility:for",
-                    )
-                    if k in tags
-                },
-            }
-        )
+        if facility is not None:
+            facilities.append(facility)
     return facilities, diag
 
 

@@ -36,6 +36,7 @@ def test_route_corridor_reuses_download_for_non_avoiding_fallback(
 
     monkeypatch.setattr(ox, "graph_from_polygon", fake_graph_from_polygon)
     monkeypatch.setattr(ox.distance, "nearest_nodes", fake_nearest_nodes)
+    monkeypatch.setenv("OSM_ROAD_DB_DIR", str(tmp_path / "empty_road_db"))
 
     flood_path = tmp_path / "flood.geojson"
     flood_path.write_text(json.dumps({
@@ -104,6 +105,7 @@ def test_route_corridor_switches_mirror_after_transport_failure(
     )
     monkeypatch.setattr(ox, "graph_from_polygon", fake_graph_from_polygon)
     monkeypatch.setattr(ox.distance, "nearest_nodes", fake_nearest_nodes)
+    monkeypatch.setenv("OSM_ROAD_DB_DIR", str(tmp_path / "empty_road_db"))
 
     result = json.loads(vec_shortest_path(
         origin_lat=29.500,
@@ -139,6 +141,7 @@ def test_route_corridor_uses_integer_overpass_query_timeout(
 
     monkeypatch.setenv("OSM_ROUTE_REQUEST_TIMEOUT_SECONDS", "20.0")
     monkeypatch.setenv("OSM_ROUTE_MAX_DOWNLOAD_ATTEMPTS", "1")
+    monkeypatch.setenv("OSM_ROAD_DB_DIR", str(tmp_path / "empty_road_db"))
     monkeypatch.setattr(ox, "graph_from_polygon", fake_graph_from_polygon)
 
     result = json.loads(vec_shortest_path(
@@ -169,6 +172,7 @@ def test_route_corridor_does_not_rotate_after_query_rejection(
         "https://mirror-b.test/api/interpreter",
     )
     monkeypatch.setattr(ox, "graph_from_polygon", fake_graph_from_polygon)
+    monkeypatch.setenv("OSM_ROAD_DB_DIR", str(tmp_path / "empty_road_db"))
 
     result = json.loads(vec_shortest_path(
         origin_lat=29.500,

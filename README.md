@@ -237,8 +237,67 @@ the GIS route tool and its bounded Overpass requests.
 
 Generated runtime artifacts remain untracked. `runs/` and `static/maps/` may
 be recreated freely. `cache/` is also rebuildable, but deleting it removes the
-Demo's real OSM road graph and all Overpass responses, forcing network access
-or a synthetic-grid fallback until the cache is rebuilt.
+Demo's real OSM road graph, the local road-network store, and all Overpass
+responses, forcing network access or a synthetic-grid fallback until the cache
+is rebuilt.
+
+## Local road-network store
+
+`vec_shortest_path` normally downloads its route corridor from Overpass at
+call time (bounded to two mirror-rotated attempts). The local road-network
+store removes that dependency for regions you pre-download: when the route
+corridor lies inside a stored region, the tool clips a corridor subgraph from
+the stored GraphML — milliseconds, fully offline — and only falls back to the
+live Overpass download for uncovered corridors. Responses report which path
+was used via `graph_source` (`local_road_db` or `overpass_live`).
+
+Build a region once (network required; tiled downloads are resumable, so an
+interrupted build only re-fetches unfinished tiles):
+
+```
+uv run python scripts/build_road_network_db.py \
+    --bbox -95.85 29.45 -94.90 30.05 --region-name houston_metro
+```
+
+This writes `cache/road_network/houston_metro__drive.graphml` plus a JSON
+index per region. Re-run with the same `--region-name` to add modes
+(`--modes walk`) or refresh tiles; delete the region's files to force a full
+rebuild. Environment variables:
+
+- `OSM_ROAD_DB_DIR` — store directory (default `cache/road_network`)
+- `OSM_ROAD_DB_DISABLED=1` — ignore the store and always download live
+
+A metro-scale graph is a few hundred MB and loads once per GIS server
+process; routing calls after that are instant. Region coverage requires the
+full corridor (including the expanded search radius) inside the stored bbox,
+so build with a margin around your area of interest.
+
+### Local POI / infrastructure store
+
+The same offline-first pattern covers the three tools that otherwise query
+Overpass live on every run: `resource_manager.get_available_resources`
+(the 50 km emergency-facility search), `osm_infrastructure
+.get_critical_infrastructure`, and `osm_infrastructure.get_road_status`.
+When the whole query circle lies inside a stored region they answer from
+disk; uncovered queries fall back to live Overpass, whose TTL for these
+facility/road-tag queries is now 24 h (data changes on the order of days).
+Their `overpass_endpoint` metadata reads `local-poi-store:<region>` when
+served locally.
+
+```
+uv run python scripts/build_poi_db.py \
+    --bbox -98.35 29.75 -97.15 30.80 --region-name austin_metro
+```
+
+Two layers: `facilities` (emergency POIs, one cheap query) and `roads`
+(highway way tags, tiled and resumable like the road-graph builder).
+Pass `--layers facilities` to skip roads. Because resource discovery
+defaults to a 50 km radius, the bbox must contain the whole 100 km query
+circle — build with generous margins. Environment variables:
+`OSM_POI_DB_DIR` (default `cache/poi_store`) and `OSM_POI_DB_DISABLED=1`.
+Serving filters elements by their resolved center point, a close
+approximation of Overpass's geometry-intersection `around` match that is
+disclosed via the `radius_filter` metadata field.
 
 The operational planning chain assigns exposed census-tract demand to
 eligible shelters and hospitals under their available capacity. It reports
@@ -319,6 +378,8 @@ Maintained standalone scripts:
 | script | purpose | network |
 |---|---|---|
 | `scripts/build_demo_road_cache.py` | Build the local Friendswood OSM road cache used by the offline demo | required |
+| `scripts/build_road_network_db.py` | Build the local road-network GraphML store served by `vec_shortest_path` before live Overpass | required |
+| `scripts/build_poi_db.py` | Build the local POI/road-tag store served by resource discovery and the OSM infrastructure tools | required |
 | `scripts/validate_historical_events.py` | Validate the versioned event manifest; add `--refresh-usgs` to refresh official peaks | offline by default; USGS only with refresh |
 | `scripts/validate_full_agent_events.py` | Run full-Agent acceptance cases and save artifacts | required |
 

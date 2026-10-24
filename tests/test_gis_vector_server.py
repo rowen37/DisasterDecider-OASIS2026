@@ -60,6 +60,7 @@ def test_bounded_poi_search_keeps_explicit_limit(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(gis, "post_overpass_sync", fake_overpass)
+    monkeypatch.setenv("OSM_POI_DB_DIR", str(tmp_path / "empty_poi_db"))
 
     payload = json.loads(gis.poi_search_osm(
         center_lat=40.54,
