@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OASIS · Workflow overview</title>
+<style>
+*{box-sizing:border-box}body{margin:0;padding:16px 12px 26px;background:#f8fafc;color:#20303f;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1280px;margin:auto}h1{text-align:center;font-size:23px;letter-spacing:-.025em;margin:0 0 6px}.subtitle{text-align:center;color:#657483;font-size:12px;margin:0 0 10px}.legend{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;font-size:10px;margin:0 0 10px}.legend span{border:1px solid var(--stroke);color:var(--ink);background:var(--fill);padding:4px 10px;border-radius:20px}.ok,.main{--ink:#245d49;--stroke:#91b3a5;--fill:#fff}.warn{--ink:#875b18;--stroke:#dfc18d;--fill:#fffbf2}.stop{--ink:#9a3741;--stroke:#deaab0;--fill:#fff6f7}.man{--ink:#285b90;--stroke:#adc6e2;--fill:#f5f9ff}.guide{max-width:1110px;margin:0 auto 12px;padding:7px 13px;background:#fff;border:1px solid #dbe3e9;border-radius:7px;text-align:center;color:#5b6b79;font-size:11px}.scroller{overflow-x:auto}.map{position:relative;width:1280px;margin:auto}.lane-head{position:absolute;top:0;font-size:10px;text-transform:uppercase;letter-spacing:.09em;text-align:center;font-weight:700;color:#758695;padding:10px 0;border-bottom:1px solid #dce4eb}.node{position:absolute;z-index:2;padding:7px 10px;background:var(--fill);border:1px solid var(--stroke);border-radius:7px;color:var(--ink);box-shadow:0 1px 3px #16303e08;display:flex;flex-direction:column;justify-content:center}.node b{display:block;font-size:12px;line-height:1.35;letter-spacing:-.008em;font-weight:650}.node small{display:block;font-size:10.5px;line-height:1.35;color:#607181;margin-top:3px}.node.main b{font-size:13px;color:#263e4c}.node.main{border-color:#8fa4b3}.node.start{background:#1d3545;color:#fff;border-color:#1d3545;text-align:center}.node.start b{color:#fff}.node.start small{color:#d3dfe8}.node.end{background:#edf6f0;border-color:#8db6a0;text-align:center}.node.end b{color:#285d43}.phase{display:block;font-size:8.5px;line-height:1.3;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:#78909d;margin:0 0 6px}.condition{font-size:8.5px;line-height:1.3;color:var(--ink);font-weight:600;margin:0 0 4px}.return-condition{font-size:8.5px;line-height:1.3;color:#47745f;margin-top:5px}.node .node-id{position:absolute;right:7px;top:5px;font:7px/1.2 ui-monospace,monospace;opacity:.4}.wires{position:absolute;inset:0;z-index:1;overflow:visible;pointer-events:none}.edge-label{font:9px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-weight:550}.layout-note{text-align:center;color:#7c8b97;font-size:10px;margin:14px 0 0}.measurement{visibility:hidden}.node:target{box-shadow:0 0 0 3px #d5e6f1}a{color:#37688e}.mode-note{font-size:10px;color:#748696;text-align:center;margin:12px 0 0}@media(max-width:800px){h1{font-size:21px}.guide{font-size:10px}.subtitle{font-size:11px}.map{margin:0}}@media print{body{padding:0;background:#fff}.scroller{overflow:visible}.wrap{max-width:none}.node{box-shadow:none;print-color-adjust:exact}.legend span{print-color-adjust:exact}.layout-note{display:none}}
+</style>
+</head>
+<body><div class="wrap">
+<h1>One question. Every path through the system.</h1>
+<p class="subtitle">Workflow overview · Original structure, translated into English</p>
+<div class="legend"><span class="ok">Continue normally</span><span class="warn">Degrade, then rejoin</span><span class="stop">Stop / withhold output</span><span class="man">Human checkpoint</span></div>
+<div class="guide">Read down the center for the normal workflow. Left branches show failures and degraded paths; right branches show human checkpoints and rejection outcomes. Orthogonal connectors use the spaces between boxes. A crossing without a dot is not a junction.</div>
+<div class="scroller"><main class="map" id="map" aria-label="Flood assessment workflow"><svg class="wires" id="wires" aria-hidden="true"></svg></main></div>
+<p class="layout-note" id="layout-note">Preparing the diagram…</p>
+</div>
+<script>
+'use strict';
+// The original 17 central nodes, 24 side nodes and 54 edges are retained.
+const MAIN=[
+ ['START','Your question','Is there flooding here? How severe is it? What should we do?<br>Place name · station ID (optional)','start'],
+ ['A1','Request understood?','Identify the hazard, location and station ID.','dec','1 · Understand the request'],
+ ['B1','Look up the official station record','Location, name and flood-category thresholds.','','2 · Get the right data'],
+ ['B2','Locate the target on the map','Use station coordinates to disambiguate place names.'],
+ ['B3','Official thresholds available?','Which stages call for caution or evacuation?','dec'],
+ ['B4','Fetch the stage observation','Now: latest reading. Past date: event-window peak.'],
+ ['B5','Is the station close enough?','Verify the distance between station and target.','dec'],
+ ['B6','Collect the other sources','Weather, alerts, forecasts, rain, population, facilities, roads and SAR.'],
+ ['C1','Do the sources conflict?','Do comparable observations disagree materially?','dec','3 · Check the evidence'],
+ ['C2','Is the satellite extent credible?','Check acquisition time, plausibility and corroboration.','dec'],
+ ['C3','Is a usable flood extent available?','Establish the operational inundation footprint.','dec'],
+ ['F1','Estimate the impacts','Affected population by tract-area share; buildings, facilities and roads.','','4 · Assess impacts & compare plans'],
+ ['F2','Major threshold crossing forecast?','','dec'],
+ ['F3','Compare rescue plans','Assign demand to facilities by capacity; show trade-offs and unmet need.'],
+ ['F4','Is this a quiet day?','Low stage, no active alerts and no positive flood extent.','dec'],
+ ['G2','Generate the report','The LLM sees verified evidence only and has no tools.','','5 · Explain & hand over'],
+ ['G4','A human decides','Show the plans, record the choice and leave execution to people. The system advises.','end'],
+];
+const SIDE=[
+ ['E1',1,'A1','stop','Ask for a clearer request','Unsupported hazard, missing place or unrecognized request.'],
+ ['E4',1,'B4','stop','Stop: no usable stage','Retries and permitted backup sources failed; verify the station ID.'],
+ ['E5',1,'B5','stop','Stop the assessment','The station is too far from the target.'],
+ ['G1',1,'F4','ok','Quiet day: brief fixed answer','Finish without LLM synthesis.'],
+ ['R5',1,'F3','stop','Withhold rescue plans','An earlier gate blocked resource optimization.'],
+ ['D1',2,'B1','warn','Station record unavailable','Disclose the verification gap and continue.'],
+ ['D2',2,'B2','warn','City boundary unavailable','Skip city clipping and continue.'],
+ ['D3',2,'B3','warn','Severity remains unverified','Collect evidence without asserting a flood category.'],
+ ['D4',2,'B4','warn','Use the permitted backup','Retry, then use the verified backup in realtime mode; disclose it.'],
+ ['D5',2,'B6','warn','Past event: skip current-only feeds','Log the skipped sources; present-day alerts do not explain a past event.'],
+ ['D6',2,'B6','warn','One source fails','Retry once; widen the SAR window when appropriate. Otherwise record a gap.'],
+ ['D7',2,'C2','warn','Exclude this satellite footprint','Stale, implausible or uncorroborated; retain only unverified context if appropriate.'],
+ ['D8',2,'C3','warn','Use a modeled extent','With verified threshold exceedance, estimate a river buffer and label it modeled.'],
+ ['D9',2,'C3','warn','No operational extent','No inundation map, affected-population estimate or rescue route; retain stage-based scoring.'],
+ ['D10',2,'F1','warn','Disclose missing inputs','Use disclosed neutral placeholders where defined; mark results degraded.'],
+ ['G3',2,'G2','warn','Discard an invalid report','Invented numbers invalidate the text; use the fixed evidence template.'],
+ ['H1',4,'A1','man','Ask for the station ID','Allow up to three attempts.'],
+ ['H2',4,'B3','man','Proceed without thresholds?','Stage alone cannot establish a verified flood category.'],
+ ['H3',4,'C1','man','Resolve the evidence conflict','Show the competing values and timestamps.'],
+ ['H4',4,'F2','man','Authorize full mobilization?','The forecast crosses the major flood threshold.'],
+ ['R1',5,'A1','stop','Stop','No valid ID after three attempts.'],
+ ['R2',5,'B3','stop','Withhold rescue plans','Continue observations; do not optimize resources.'],
+ ['R3',5,'C1','stop','Withhold rescue plans','The conflict remains unresolved.'],
+ ['R4',5,'F2','stop','No authorization, no mobilization','A critical timeout does not grant consent.'],
+];
+// [from, to, category, condition]
+const EDGES=[
+ ['START','A1','ok',''],['A1','E1','stop','Unsupported / no place'],['A1','H1','man','No ID'],['A1','B1','ok','Understood'],['H1','B1','ok','ID supplied'],['H1','R1','stop','3 failed attempts'],
+ ['B1','D1','warn','No response'],['B1','B2','ok',''],['D1','B2','warn',''],['B2','D2','warn','No boundary'],['B2','B3','ok',''],['D2','B3','warn',''],
+ ['B3','H2','man','Unavailable'],['B3','B4','ok','Available'],['H2','D3','man','Approved'],['H2','R2','stop','Denied / timeout'],['D3','B4','warn',''],
+ ['B4','D4','warn','Primary fails'],['B4','E4','stop','All fail'],['B4','B5','ok',''],['D4','B5','warn',''],['B5','E5','stop','Too far'],['B5','B6','ok','Nearby'],
+ ['B6','D5','warn','Historical'],['B6','D6','warn','Source failure'],['B6','C1','ok',''],['D5','C1','warn',''],['D6','C1','warn',''],
+ ['C1','H3','man','Conflict'],['C1','C2','ok','Consistent'],['H3','C2','ok','Resolved: proceed'],['H3','R3','stop','Denied / timeout'],
+ ['C2','D7','warn','Not credible'],['C2','C3','ok','Credible'],['D7','C3','warn',''],['C3','D8','warn','Above threshold; no SAR'],['C3','D9','warn','Below threshold'],['C3','F1','ok','Observed extent'],['D8','F1','warn',''],['D9','F1','warn',''],
+ ['F1','D10','warn','Missing inputs'],['F1','F2','ok',''],['D10','F2','warn',''],['F2','H4','man','Yes'],['F2','F3','ok','No'],['H4','F3','ok','Authorized'],['H4','R4','stop','Denied / timeout'],
+ ['F3','R5','stop','Gate blocked'],['F3','F4','ok',''],['F4','G1','ok','Quiet'],['F4','G2','ok','Report needed'],['G2','G3','warn','Invalid numbers'],['G2','G4','ok',''],['G3','G4','warn',''],
+];
+const COLORS={ok:'#47856c',warn:'#b27c28',stop:'#bd505b',man:'#447cae'};
+const COLS={1:[16,176],2:[240,208],3:[496,288],4:[832,208],5:[1088,176]};
+const map=document.getElementById('map'),svg=document.getElementById('wires'),NS='http://www.w3.org/2000/svg',GRID=8;
+const nodes=new Map();
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+for(const [col,title]of Object.entries({1:'Exit / end',2:'Degrade & rejoin',3:'Normal workflow',4:'Human checkpoint',5:'Rejected / no response'})){const el=document.createElement('div');el.className='lane-head';el.style.left=COLS[col][0]+'px';el.style.width=COLS[col][1]+'px';el.textContent=title;map.append(el)}
+function makeNode(id,col,title,description,cls='',phase=''){
+ const el=document.createElement('article');el.id=id;el.className='node '+cls+(col===3?' main':'');el.style.left=COLS[col][0]+'px';el.style.width=COLS[col][1]+'px';el.innerHTML=`<span class="node-id">${id}</span>${phase?`<span class="phase">${esc(phase)}</span>`:''}<b>${esc(title)}</b>${description?`<small>${description}</small>`:''}`;map.append(el);nodes.set(id,{id,col,el,x:COLS[col][0],w:COLS[col][1]});
+}
+MAIN.forEach(([id,t,d,c,p])=>makeNode(id,3,t,d,c,p));SIDE.forEach(([id,c,near,cls,t,d])=>{makeNode(id,c,t,d,cls);nodes.get(id).near=near});
+// Place branch conditions inside their associated side boxes, keeping gutters clear.
+const conditionEdges=new Set();
+EDGES.forEach(([from,to,kind,label],i)=>{
+ if(!label)return;
+ const f=nodes.get(from),t=nodes.get(to);
+ if(t.col!==3){const el=document.createElement('span');el.className='condition';el.textContent=label;t.el.insertBefore(el,t.el.querySelector('b'));conditionEdges.add(i)}
+ else if(f.col!==3){const el=document.createElement('span');el.className='return-condition';el.textContent=label+' → continue';f.el.append(el);conditionEdges.add(i)}
+});
+function add(tag,attrs,parent=svg){const el=document.createElementNS(NS,tag);for(const[k,v]of Object.entries(attrs))el.setAttribute(k,String(v));parent.append(el);return el}
+function arrange(gap=32){
+ for(const n of nodes.values()){n.el.style.height='auto';n.h=Math.ceil(n.el.getBoundingClientRect().height/16)*16;n.el.style.height=n.h+'px'}
+ let y=48;
+ for(const [id]of MAIN){const primary=nodes.get(id),group=SIDE.filter(s=>s[2]===id).map(s=>nodes.get(s[0]));let height=primary.h;
+  for(const c of [1,2,4,5]){const list=group.filter(n=>n.col===c);height=Math.max(height,list.reduce((sum,n)=>sum+n.h,0)+Math.max(0,list.length-1)*16)}
+  height=Math.ceil(height/16)*16;primary.y=y+Math.floor((height-primary.h)/32)*16;
+  for(const c of [1,2,4,5]){const list=group.filter(n=>n.col===c);const total=list.reduce((sum,n)=>sum+n.h,0)+Math.max(0,list.length-1)*16;let sy=y+Math.floor((height-total)/32)*16;for(const n of list){n.y=sy;sy+=n.h+16}}
+  y+=height+gap;
+ }
+ for(const n of nodes.values()){n.el.style.top=n.y+'px';n.r=n.x+n.w;n.b=n.y+n.h;n.cx=n.x+n.w/2;n.cy=n.y+n.h/2}
+ map.style.height=y+'px';svg.setAttribute('width',1280);svg.setAttribute('height',y);svg.setAttribute('viewBox',`0 0 1280 ${y}`);return y;
+}
+class Heap{
+ constructor(){this.a=[]}push(v){const a=this.a;a.push(v);let i=a.length-1;while(i){let p=(i-1)>>1;if(a[p].f<=v.f)break;a[i]=a[p];i=p}a[i]=v}pop(){const a=this.a,top=a[0],last=a.pop();if(a.length){let i=0;while(true){let c=i*2+1;if(c>=a.length)break;if(c+1<a.length&&a[c+1].f<a[c].f)c++;if(a[c].f>=last.f)break;a[i]=a[c];i=c}a[i]=last}return top}get length(){return this.a.length}
+}
+function ports(edges){
+ const requests=new Map();
+ edges.forEach((e,i)=>{const f=nodes.get(e.f),t=nodes.get(e.t);if(f.col===3&&t.col===3){e.fs='b';e.ts='t';e.trunk=true}else if(f.col===3){e.fs=t.col<3?'l':'r';e.ts=t.col<3?'r':'l'}else if(t.col===3){e.fs=f.col<3?'r':'l';e.ts=f.col<3?'l':'r'}else if(f.col===4&&t.col===5){e.fs='r';e.ts='l'}else{e.fs='b';e.ts='r'}
+  for(const[role,n,side,other]of [['a',f,e.fs,t],['b',t,e.ts,f]]){const key=n.id+side;if(!requests.has(key))requests.set(key,[]);requests.get(key).push({e,role,n,side,order:side==='l'||side==='r'?other.cy:other.cx})}
+ });
+ for(const list of requests.values()){list.sort((a,b)=>a.order-b.order);list.forEach((q,i)=>{const offset=(i-(list.length-1)/2)*16,{n,side}=q;let x=n.cx,y=n.cy;if(side==='l')x=n.x;if(side==='r')x=n.r;if(side==='t')y=n.y;if(side==='b')y=n.b;if(side==='l'||side==='r')y=Math.round((y+offset)/GRID)*GRID;else x=Math.round((x+offset)/GRID)*GRID;const direction={l:[-1,0],r:[1,0],t:[0,-1],b:[0,1]}[side];q.e[q.role]=[x,y];q.e[q.role+'out']=[x+direction[0]*16,y+direction[1]*16]})}
+}
+function buildRoutes(height){
+ const edges=EDGES.map(([f,t,c,l],i)=>({f,t,c,l,id:i}));ports(edges);
+ const W=1280/GRID+1,H=Math.ceil(height/GRID)+1,N=W*H,blocked=new Uint8Array(N),usedH=new Uint8Array(N),usedV=new Uint8Array(N);
+ for(const n of nodes.values())for(let gy=Math.max(0,Math.ceil((n.y-8)/GRID));gy<=Math.min(H-1,Math.floor((n.b+8)/GRID));gy++)for(let gx=Math.ceil((n.x-8)/GRID);gx<=Math.floor((n.r+8)/GRID);gx++)blocked[gy*W+gx]=1;
+ function mark(points){for(let i=1;i<points.length;i++){const a=points[i-1],b=points[i];const dx=Math.sign(b[0]-a[0]),dy=Math.sign(b[1]-a[1]);let x=a[0]/GRID,y=a[1]/GRID;const ex=b[0]/GRID,ey=b[1]/GRID;while(x!==ex||y!==ey){const k=y*W+x;if(dx){usedH[k]=1;usedH[(y*W+x+dx)]=1}else{usedV[k]=1;usedV[((y+dy)*W+x)]=1}x+=dx;y+=dy}}}
+ function route(a,b,relax=false){const ax=a[0]/GRID,ay=a[1]/GRID,bx=b[0]/GRID,by=b[1]/GRID,start=ay*W+ax,end=by*W+bx,dist=new Float64Array(N*4);dist.fill(Infinity);const prev=new Int32Array(N*4);prev.fill(-1);const heap=new Heap();
+  for(let dir=0;dir<4;dir++){const state=start*4+dir;dist[state]=0;heap.push({state,g:0,f:10*(Math.abs(ax-bx)+Math.abs(ay-by))})}
+  const dirs=[[1,0],[-1,0],[0,1],[0,-1]];let finish=-1;
+  while(heap.length){const cur=heap.pop();if(cur.g!==dist[cur.state])continue;const p=cur.state>>2,dir=cur.state%4,x=p%W,y=Math.floor(p/W);if(p===end){finish=cur.state;break}
+   for(let nd=0;nd<4;nd++){const[dx,dy]=dirs[nd],nx=x+dx,ny=y+dy;if(nx<1||nx>=W-1||ny<6||ny>=H-1)continue;const np=ny*W+nx;if(blocked[np]&&np!==end)continue;
+    const horizontal=nd<2,shared=horizontal?(usedH[p]&&usedH[np]):(usedV[p]&&usedV[np]);if(shared&&!relax)continue;
+    const crossing=horizontal?usedV[np]:usedH[np];const nearParallel=horizontal?usedH[np]:usedV[np];
+    const g=cur.g+10+(nd===dir?0:17)+(shared?2500:0)+(crossing?75:0)+(nearParallel?4:0),state=np*4+nd;
+    if(g<dist[state]){dist[state]=g;prev[state]=cur.state;heap.push({state,g,f:g+10*(Math.abs(nx-bx)+Math.abs(ny-by))})}
+   }
+  }
+  if(finish<0)return null;const points=[];for(let s=finish;s>=0;s=prev[s]){const p=s>>2;points.push([(p%W)*GRID,Math.floor(p/W)*GRID])}points.reverse();return points;
+ }
+ const order=[...edges].sort((a,b)=>Number(b.trunk)-Number(a.trunk)||Math.abs(nodes.get(b.f).col-nodes.get(b.t).col)-Math.abs(nodes.get(a.f).col-nodes.get(a.t).col)||a.id-b.id);
+ let relaxed=0;
+ for(const e of order){let middle=route(e.aout,e.bout);if(!middle){relaxed++;middle=route(e.aout,e.bout,true)}if(!middle)throw new Error(`Cannot route ${e.f} → ${e.t}`);let points=[e.a,e.aout,...middle.slice(1,-1),e.bout,e.b];
+  const clean=[];for(const p of points){if(clean.length&&clean.at(-1)[0]===p[0]&&clean.at(-1)[1]===p[1])continue;while(clean.length>=2){const a=clean.at(-2),b=clean.at(-1);if((a[0]===b[0]&&b[0]===p[0])||(a[1]===b[1]&&b[1]===p[1]))clean.pop();else break}clean.push(p)}e.points=clean;mark(clean);
+ }
+ return{edges,relaxed};
+}
+function intersects(segment,rect,inset=0){const[a,b]=segment,x0=rect.x+inset,x1=rect.x+rect.w-inset,y0=rect.y+inset,y1=rect.y+rect.h-inset;return a[0]===b[0]?a[0]>x0&&a[0]<x1&&Math.max(a[1],b[1])>y0&&Math.min(a[1],b[1])<y1:a[1]>y0&&a[1]<y1&&Math.max(a[0],b[0])>x0&&Math.min(a[0],b[0])<x1}
+const overlap=(a,b,pad=0)=>Math.min(a.x+a.w+pad,b.x+b.w+pad)>Math.max(a.x-pad,b.x-pad)&&Math.min(a.y+a.h+pad,b.y+b.h+pad)>Math.max(a.y-pad,b.y-pad);
+function render(result,height){
+ svg.replaceChildren();const defs=add('defs',{});for(const[k,c]of Object.entries(COLORS)){const marker=add('marker',{id:'arrow-'+k,viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto'},defs);add('path',{d:'M1 1 L9 5 L1 9',fill:'none',stroke:c,'stroke-width':1.5},marker)}
+ const edges=result.edges,segments=edges.flatMap(e=>e.points.slice(1).map((p,i)=>({edge:e,points:[e.points[i],p]})));
+ // A white casing keeps crossings visually separate; no junction is implied.
+ for(const e of [...edges].sort((a,b)=>Number(a.trunk)-Number(b.trunk))){const d=e.points.map((p,i)=>(i?'L':'M')+p.join(',')).join(' ');add('path',{d,fill:'none',stroke:'#f8fafc','stroke-width':5.5,'stroke-linejoin':'round'});add('path',{d,fill:'none',stroke:COLORS[e.c],'stroke-width':e.trunk?1.7:1.35,'stroke-linejoin':'round','stroke-dasharray':e.c==='warn'?'5 3':'none','marker-end':'url(#arrow-'+e.c+')'})}
+ const canvas=document.createElement('canvas'),ctx=canvas.getContext('2d');ctx.font='550 9px -apple-system, BlinkMacSystemFont, sans-serif';
+ const labels=[],unplaced=[];
+ for(const e of edges.filter(e=>e.l&&!conditionEdges.has(e.id)).sort((a,b)=>b.l.length-a.l.length)){
+  const words=e.l.split(' '),lines=[];let line='';for(const word of words){const next=line?line+' '+word:word;if(ctx.measureText(next).width>86&&line){lines.push(line);line=word}else line=next}if(line)lines.push(line);const w=Math.ceil(Math.max(...lines.map(s=>ctx.measureText(s).width)))+8,h=lines.length*11+4,candidates=[];
+  for(let i=1;i<e.points.length;i++){const a=e.points[i-1],b=e.points[i],length=Math.abs(b[0]-a[0])+Math.abs(b[1]-a[1]);for(const f of [.5,.25,.75]){const x=a[0]+(b[0]-a[0])*f,y=a[1]+(b[1]-a[1])*f;
+    if(a[1]===b[1]){for(const dy of [-h-3,3,-h/2])candidates.push({x:x-w/2,y:y+dy,w,h,score:length>=w?0:30})}
+    else{for(const dx of [5,-w-5])candidates.push({x:x+dx,y:y-h/2,w,h,score:length>=h?4:30})}
+  }}
+  let best=null,score=Infinity;for(const r of candidates){if(r.x<2||r.x+r.w>1278||r.y<44||r.y+r.h>height-3)continue;if([...nodes.values()].some(n=>overlap(r,n,3))||labels.some(l=>overlap(r,l,3)))continue;const hits=segments.filter(s=>s.edge!==e&&intersects(s.points,r)).length;const value=r.score+hits*100;if(value<score){score=value;best=r}}
+  if(!best){unplaced.push(e.id);continue}const g=add('g',{'data-edge':e.f+'-'+e.t});add('rect',{x:best.x,y:best.y,width:w,height:h,rx:2,fill:'#f8fafc'},g);const t=add('text',{x:best.x+4,y:best.y+10,class:'edge-label',fill:COLORS[e.c]},g);lines.forEach((s,i)=>{const sp=add('tspan',{x:best.x+4,dy:i?11:0},t);sp.textContent=s});labels.push({...best,edge:e.id,lineHits:Math.floor(score/100)});
+ }
+ const boxes=[...nodes.values()],nodeOverlaps=[];boxes.forEach((a,i)=>boxes.slice(i+1).forEach(b=>{if(overlap(a,b))nodeOverlaps.push([a.id,b.id])}));const lineNodeCollisions=[];segments.forEach(s=>boxes.forEach(n=>{if(intersects(s.points,n,.5))lineNodeCollisions.push([s.edge.f,s.edge.t,n.id])}));
+ const parallelOverlaps=[];segments.forEach((s,i)=>segments.slice(i+1).forEach(t=>{if(s.edge===t.edge)return;const[a,b]=s.points,[c,d]=t.points;if(a[1]===b[1]&&c[1]===d[1]&&a[1]===c[1]&&Math.min(Math.max(a[0],b[0]),Math.max(c[0],d[0]))>Math.max(Math.min(a[0],b[0]),Math.min(c[0],d[0])))parallelOverlaps.push([s.edge.id,t.edge.id]);if(a[0]===b[0]&&c[0]===d[0]&&a[0]===c[0]&&Math.min(Math.max(a[1],b[1]),Math.max(c[1],d[1]))>Math.max(Math.min(a[1],b[1]),Math.min(c[1],d[1])))parallelOverlaps.push([s.edge.id,t.edge.id])}));
+ const audit={nodes:boxes.length,edges:edges.length,height,width:1280,nodeOverlaps,lineNodeCollisions,parallelOverlaps,unplacedLabels:unplaced,labelsAcrossOtherLines:labels.filter(l=>l.lineHits>0).map(l=>l.edge),relaxedRoutes:result.relaxed};window.structureAudit=audit;
+ document.getElementById('layout-note').textContent=`17 main nodes · 24 side nodes · 54 connections · Original overview scope`;
+ // Compact, readable diagnostic in accessibility text; no additional diagram content.
+ document.getElementById('layout-note').title=JSON.stringify(audit);
+ return audit;
+}
+function layout(){let audit;for(const gap of [24,32,40]){const height=arrange(gap),routes=buildRoutes(height);audit=render(routes,height);if(!audit.nodeOverlaps.length&&!audit.lineNodeCollisions.length&&!audit.parallelOverlaps.length&&!audit.unplacedLabels.length&&!audit.labelsAcrossOtherLines.length)break}document.getElementById('layout-note').setAttribute('aria-label','Layout check: '+JSON.stringify(audit))}
+document.fonts.ready.then(()=>{try{layout()}catch(error){document.getElementById('layout-note').textContent='Layout error: '+error.message}});window.addEventListener('resize',()=>{ /* Fixed canvas preserves the same clear routing on narrow screens. */ });
+</script>
+</body></html>
