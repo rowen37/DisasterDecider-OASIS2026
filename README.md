@@ -10,3 +10,8 @@ Static GitHub Pages publishing branch for the presentation and workflow overview
 
 To update, replace the rendered HTML and corresponding resources, then push to
 `codex/presentation-pages`. GitHub Pages publishes this branch from its root.
+
+## Demo
+
+`demo.html` plays `demo.mp4` inline, with `demo-poster.jpg` as its preview.
+The video joins the 06:24:00 recording followed by the 06:56:06 recording.
