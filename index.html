@@ -1,18 +1,112 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OASIS 2026 · DisasterDecider</title>
-<style>
-body{margin:0;background:#f6f8fb;color:#15243a;font:18px/1.6 system-ui,sans-serif}main{max-width:760px;margin:12vh auto;padding:32px}h1{font-size:clamp(2rem,5vw,3rem);line-height:1.15}p{color:#53637a}a{display:block;padding:24px;margin:18px 0;border:1px solid #dce3ef;border-radius:16px;background:#fff;color:#174c94;text-decoration:none}a:hover,a:focus-visible{border-color:#174c94;background:#eef4ff}strong{display:block;font-size:1.2rem}span{color:#53637a;font-size:1rem}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="DisasterDecider at OASIS 2026. Conference slides, a recorded flood response demo, and an interactive workflow.">
+  <title>Beyond Tool Calling · DisasterDecider at OASIS ’26</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f6f3ec;
+      --surface: #fffdf8;
+      --navy: #23364d;
+      --ink: #3b494a;
+      --line: #c9d2ce;
+      --mint: #9dd2c7;
+      --serif: Georgia, "Times New Roman", serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.6 system-ui, sans-serif; }
+    h1, h2, h3, p, figure { margin: 0; }
+    a { color: inherit; }
+    a:focus-visible { outline: 2px solid #42776e; outline-offset: 4px; }
+    .shell { width: min(1100px, calc(100% - 64px)); margin-inline: auto; }
+    .top { border-bottom: 1px solid var(--line); }
+    .top .shell { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 64px; }
+    .mark { display: inline-flex; align-items: center; gap: 9px; color: var(--navy); text-decoration: none; font-weight: 750; }
+    .mark::before { content: ""; width: 20px; height: 3px; background: #649c91; }
+    .micro { color: var(--navy); font-size: .73rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr); align-items: center; gap: clamp(26px, 6vw, 75px); padding-block: clamp(34px, 6vw, 80px) clamp(28px, 5vw, 64px); }
+    h1 { margin: 11px 0 13px; color: var(--navy); font: 400 clamp(3rem, 7vw, 5.3rem)/.98 var(--serif); letter-spacing: -.05em; }
+    .intro { max-width: 43ch; font-size: 1.04rem; }
+    .authors { margin-top: 17px; font-size: .9rem; color: var(--navy); }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 19px; }
+    .button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; padding: 8px 13px; min-height: 44px; border-radius: 11px; border: 1px solid var(--line); color: var(--navy); text-decoration: none; font-size: .85rem; font-weight: 650; }
+    .button:hover { background: #e5efeb; }
+    .button.primary { background: var(--navy); border-color: var(--navy); color: var(--surface); }
+    .button.primary:hover { background: #354d67; }
+    .plate { background: var(--surface); border: 1px solid var(--line); border-radius: 13px; padding: clamp(10px, 2vw, 17px); }
+    .plate img { display: block; width: 100%; height: auto; }
+    figcaption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin-top: 8px; font-size: .78rem; }
+    figcaption a { color: var(--navy); text-underline-offset: 3px; }
+    .resources { border-top: 1px solid var(--line); padding-block: 20px 38px; }
+    h2 { color: var(--navy); font: 400 1.6rem/1.2 var(--serif); margin-bottom: 12px; }
+    .resource-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .resource { display: block; padding: 13px 15px 16px; border-radius: 11px; border: 1px solid var(--line); border-top: 3px solid var(--mint); background: var(--surface); text-decoration: none; }
+    .resource:hover { border-color: #649c91; background: #edf4ef; }
+    h3 { display: flex; justify-content: space-between; gap: 8px; margin: 4px 0 6px; color: var(--navy); font: 400 1.28rem/1.2 var(--serif); }
+    .resource p { font-size: .85rem; }
+    .footer { border-top: 1px solid var(--line); padding-block: 14px 24px; font-size: .82rem; }
+    @media (max-width: 700px) {
+      .shell { width: calc(100% - 36px); }
+      .top .shell { min-height: 54px; }
+      .top .micro { font-size: .61rem; letter-spacing: .08em; text-align: right; }
+      .hero, .resource-grid { grid-template-columns: minmax(0, 1fr); }
+      h1 { font-size: clamp(2.75rem, 13vw, 4rem); }
+    }
+  </style>
 </head>
-<body><main>
-<p>OASIS 2026 · DisasterDecider</p>
-<h1>Beyond Tool Calling</h1>
-<p>Presentation, demo and workflow overview</p>
-<a href="talk_slides.html"><strong>Open presentation →</strong><span>View the interactive slides in your browser.</span></a>
-<a href="demo.html"><strong>Watch demo →</strong><span>Watch the full system demonstration in your browser.</span></a>
-<a href="flowchart_structure.en.html"><strong>Open workflow overview →</strong><span>Explore the system structure and workflow.</span></a>
-</main></body></html>
+<body>
+  <header class="top">
+    <div class="shell">
+      <a class="mark" href="./">DisasterDecider</a>
+      <p class="micro">OASIS ’26 / Riverside, CA</p>
+    </div>
+  </header>
+  <main class="shell">
+    <section class="hero" aria-labelledby="talk-title">
+      <div>
+        <p class="micro">ACM SIGSPATIAL Student Challenge</p>
+        <h1 id="talk-title">Beyond Tool Calling</h1>
+        <p class="intro">How should a flood response system handle a missing satellite image or an out-of-date reading? The OASIS talk uses a Clear Creek replay to show how DisasterDecider checks the evidence, estimates exposure, and presents response options for human review.</p>
+        <p class="authors">Qiwen Bian and Jiabei Xu</p>
+        <div class="actions">
+          <a class="button primary" href="talk_slides.html">Open conference slides <span aria-hidden="true">↗</span></a>
+          <a class="button" href="demo.html">Watch the demo <span aria-hidden="true">↗</span></a>
+        </div>
+      </div>
+      <figure class="plate">
+        <img src="figs/fig2_replay_map.png" width="1440" height="830" alt="Clear Creek replay map showing flood exposure and assignments to hospitals and shelters.">
+        <figcaption>
+          <span>Clear Creek, Texas / Offline replay</span>
+          <a href="figs/fig2_replay_map.png">View full map</a>
+        </figcaption>
+      </figure>
+    </section>
+    <nav class="resources" aria-labelledby="materials-title">
+      <h2 id="materials-title">Presentation materials</h2>
+      <div class="resource-grid">
+        <a class="resource" href="talk_slides.html">
+          <span class="micro">01 / Slides</span>
+          <h3>Conference talk <span aria-hidden="true">↗</span></h3>
+          <p>See the system design, the Clear Creek case, and what the agent can still report when inputs are missing or unreliable.</p>
+        </a>
+        <a class="resource" href="demo.html">
+          <span class="micro">02 / Video</span>
+          <h3>System demo <span aria-hidden="true">↗</span></h3>
+          <p>Watch the agent check its inputs and compare resource allocations in a recorded run.</p>
+        </a>
+        <a class="resource" href="flowchart_structure.en.html">
+          <span class="micro">03 / Diagram</span>
+          <h3>Interactive workflow <span aria-hidden="true">↗</span></h3>
+          <p>Follow the steps from the first evidence check to the operator’s review of the proposed plans.</p>
+        </a>
+      </div>
+    </nav>
+    <footer class="footer">
+      <a href="https://qiwenb.pages.dev/?project=oasis">DisasterDecider research page <span aria-hidden="true">↗</span></a>
+    </footer>
+  </main>
+</body>
+</html>
